@@ -1,0 +1,12 @@
+# Your personal library (image paths, tags, prompts) - never commit this
+library.db
+
+# Build output
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
