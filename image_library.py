@@ -61,12 +61,12 @@ def unique_path(target):
 THUMB_DIR = BASE / "thumbs"
 
 
-def make_thumb(path):
+def make_thumb(path, placeholder=True):
     """PIL thumbnail for a file, read from / saved to the on-disk cache when possible."""
     try:
         st = os.stat(path)
     except OSError:
-        return Image.new("RGB", (THUMB, THUMB), "#888888")
+        return Image.new("RGB", (THUMB, THUMB), "#888888") if placeholder else None
     key = hashlib.md5(f"{path}|{st.st_mtime_ns}|{st.st_size}|{THUMB}".encode()).hexdigest()
     cache_file = THUMB_DIR / f"{key}.jpg"
     try:
@@ -80,7 +80,7 @@ def make_thumb(path):
         img = img.convert("RGB")
         img.thumbnail((THUMB, THUMB))
     except Exception:
-        return Image.new("RGB", (THUMB, THUMB), "#888888")
+        return Image.new("RGB", (THUMB, THUMB), "#888888") if placeholder else None
     try:
         THUMB_DIR.mkdir(exist_ok=True)
         img.save(cache_file, "JPEG", quality=85)
@@ -94,6 +94,93 @@ def thumb_worker(items, token, state, q):
         if state["token"] != token:  # a newer page was drawn, stop wasting effort
             return
         q.put((token, iid, path, make_thumb(path)))
+
+
+popcount = int.bit_count if hasattr(int, "bit_count") else (lambda x: bin(x).count("1"))
+
+
+def dhash(img):
+    """64-bit 'difference hash': survives resizing, re-saving and small colour changes."""
+    px = img.convert("L").resize((9, 8), Image.LANCZOS).tobytes()
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+    return bits
+
+
+def find_similar(items, t):
+    """items: [(id, 64-bit hash)]. Groups of ids linked by Hamming distance <= t.
+    Splits the hash into t+1 bands: hashes within t bits must share at least one identical band,
+    so only images sharing a band are compared."""
+    n = len(items)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    bands = t + 1
+    bounds = [round(i * 64 / bands) for i in range(bands + 1)]
+    for b in range(bands):
+        lo, width = bounds[b], bounds[b + 1] - bounds[b]
+        mask = (1 << width) - 1
+        buckets = {}
+        for idx, (_, h) in enumerate(items):
+            buckets.setdefault((h >> lo) & mask, []).append(idx)
+        for members in buckets.values():
+            for i in range(len(members) - 1):
+                a = members[i]
+                ha = items[a][1]
+                for j in range(i + 1, len(members)):
+                    c = members[j]
+                    if popcount(ha ^ items[c][1]) <= t:
+                        ra, rc = find(a), find(c)
+                        if ra != rc:
+                            parent[ra] = rc
+    groups = {}
+    for idx in range(n):
+        groups.setdefault(find(idx), []).append(items[idx][0])
+    return sorted((g for g in groups.values() if len(g) > 1), key=len, reverse=True)
+
+
+def similar_worker(db_path, threshold, q, cancel):
+    """Background job: hash any images not yet analysed, then group look-alikes."""
+    try:
+        db = sqlite3.connect(db_path, timeout=30)
+        todo = db.execute("SELECT id, path FROM images WHERE phash IS NULL").fetchall()
+        q.put(("total", len(todo)))
+        for n, (iid, path) in enumerate(todo, 1):
+            if cancel.is_set():
+                break
+            h = ""
+            if os.path.exists(path):
+                img = make_thumb(path, placeholder=False)  # also warms the thumbnail cache
+                if img is not None:
+                    h = format(dhash(img), "016x")
+            db.execute("UPDATE images SET phash=? WHERE id=?", (h, iid))
+            if n % 25 == 0:
+                db.commit()
+                q.put(("progress", n))
+        db.commit()
+        if cancel.is_set():
+            db.close()
+            q.put(("done", True))
+            return
+        q.put(("searching",))
+        items = []
+        for iid, h, path in db.execute(
+                "SELECT id, phash, path FROM images WHERE phash IS NOT NULL AND phash != ''"):
+            v = int(h, 16)
+            if 6 <= popcount(v) <= 58 and os.path.exists(path):  # skip blank / flat images
+                items.append((iid, v))
+        db.close()
+        q.put(("groups", find_similar(items, int(threshold))))
+        q.put(("done", False))
+    except Exception as e:
+        q.put(("error", str(e)))
 
 
 def file_hash(p):
@@ -241,7 +328,7 @@ class App:
         root.geometry("1280x740")
         self.db = sqlite3.connect(DB_PATH, timeout=30)
         self.db.executescript(SCHEMA)
-        for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0"):
+        for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0", "phash TEXT"):
             try:
                 self.db.execute(f"ALTER TABLE images ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -300,6 +387,7 @@ class App:
         ttk.Button(top2, text="Delete duplicates…", command=self.delete_duplicates_dialog).pack(
             side="left")
         ttk.Button(top2, text="Watch folders…", command=self.watch_dialog).pack(side="left", padx=4)
+        ttk.Button(top2, text="Find similar…", command=self.similar_dialog).pack(side="left")
         self.prog = ttk.Frame(top2)  # shown only while a folder is being indexed
         self.prog_label = ttk.Label(self.prog, text="")
         self.prog_label.pack(side="left", padx=6)
@@ -789,6 +877,228 @@ class App:
                 self.refresh()  # nothing to lose, so show the new images straight away
             else:
                 self.refresh_sidebar()
+
+    # ---------- similar images ----------
+    def describe(self, iid):
+        path = self.db.execute("SELECT path FROM images WHERE id=?", (iid,)).fetchone()[0]
+        try:
+            with Image.open(path) as im:
+                w, h = im.size
+        except Exception:
+            w = h = 0
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        return {"id": iid, "path": path, "w": w, "h": h, "pixels": w * h, "size": size}
+
+    def similar_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Find similar images")
+        win.geometry("1060x700")
+        win.transient(self.root)
+        win.grab_set()
+        st = {"groups": [], "cur": None, "items": [], "photos": [], "job": None}
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=12, pady=10)
+        ttk.Label(top, text="Strictness:").pack(side="left")
+        scale = tk.Scale(top, from_=0, to=10, orient="horizontal", length=220)
+        scale.set(5)
+        scale.pack(side="left", padx=6)
+        ttk.Label(top, text="0 = near-identical, higher = looser matches. Try 3 to 5 first.").pack(
+            side="left", padx=6)
+        search_btn = ttk.Button(top, text="Search")
+        search_btn.pack(side="left", padx=8)
+        auto_btn = ttk.Button(top, text="Keep the largest in every group…", state="disabled")
+        auto_btn.pack(side="left")
+        bar = ttk.Progressbar(win, mode="determinate")
+        bar.pack(fill="x", padx=12)
+        status = ttk.Label(win, text="Press Search. Each image is analysed once and remembered, "
+                           "so later searches are much quicker.")
+        status.pack(anchor="w", padx=12, pady=4)
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=4)
+        gl = tk.Listbox(body, width=22, exportselection=False, activestyle="none")
+        gl.pack(side="left", fill="y")
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        canvas = tk.Canvas(right, highlightthickness=0)
+        sb = ttk.Scrollbar(right, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        action = ttk.Frame(win)
+        action.pack(fill="x", padx=12, pady=10)
+        apply_btn = ttk.Button(action, text="Apply to this group (unticked go to Recycle Bin)")
+        apply_btn.pack(side="left")
+        skip_btn = ttk.Button(action, text="Skip group")
+        skip_btn.pack(side="left", padx=6)
+
+        def clear_view():
+            for w in inner.winfo_children():
+                w.destroy()
+            st["items"], st["photos"], st["cur"] = [], [], None
+
+        def fill_groups():
+            gl.delete(0, "end")
+            for n, g in enumerate(st["groups"], 1):
+                gl.insert("end", f"Group {n} · {len(g)} images")
+            clear_view()
+            auto_btn.config(state="normal" if st["groups"] else "disabled")
+            if st["groups"]:
+                gl.selection_set(0)
+                show_group()
+
+        def show_group(event=None):
+            sel = gl.curselection()
+            if not sel:
+                return
+            clear_view()
+            gid = st["cur"] = sel[0]
+            infos = [self.describe(i) for i in st["groups"][gid][:30]]
+            best = max(infos, key=lambda d: (d["pixels"], d["size"]))
+            for n, d in enumerate(infos):
+                cell = ttk.Frame(inner, padding=6)
+                cell.grid(row=n // 3, column=n % 3, sticky="n")
+                try:
+                    im = Image.open(d["path"])
+                    im.draft("RGB", (460, 460))
+                    im = im.convert("RGB")
+                    im.thumbnail((230, 230))
+                except Exception:
+                    im = Image.new("RGB", (230, 170), "#888888")
+                ph = ImageTk.PhotoImage(im)
+                st["photos"].append(ph)
+                tk.Label(cell, image=ph).pack()
+                ttk.Label(cell, justify="center", wraplength=230,
+                          text=f"{Path(d['path']).name}\n{d['w']}×{d['h']} · {d['size'] / 1048576:.2f} MB"
+                          ).pack()
+                d["var"] = tk.BooleanVar(value=d is best)
+                ttk.Checkbutton(cell, text="Keep", variable=d["var"]).pack()
+                st["items"].append(d)
+            canvas.yview_moveto(0)
+
+        def remove_group(gid):
+            del st["groups"][gid]
+            fill_groups()
+            if st["groups"]:
+                gl.selection_clear(0, "end")
+                gl.selection_set(min(gid, len(st["groups"]) - 1))
+                show_group()
+
+        def apply():
+            gid = st["cur"]
+            if gid is None:
+                return
+            keep = [d for d in st["items"] if d["var"].get()]
+            drop = [d for d in st["items"] if not d["var"].get()]
+            if not keep:
+                messagebox.showwarning("Keep at least one", "Tick Keep on at least one image.",
+                                       parent=win)
+                return
+            if drop:
+                done, failed, freed = self.delete_dups(
+                    [((keep[0]["id"], keep[0]["path"]), [(d["id"], d["path"]) for d in drop])])
+                status.config(text=f"Sent {done} to the Recycle Bin ({freed / 1048576:.1f} MB)"
+                              + (f", {failed} failed" if failed else ""))
+            remove_group(gid)
+
+        def skip():
+            if st["cur"] is not None:
+                remove_group(st["cur"])
+
+        def auto_all():
+            if not st["groups"]:
+                return
+            plan = []
+            for g in st["groups"]:
+                infos = [self.describe(i) for i in g]
+                best = max(infos, key=lambda d: (d["pixels"], d["size"]))
+                plan.append(((best["id"], best["path"]),
+                             [(d["id"], d["path"]) for d in infos if d is not best]))
+            extras = sum(len(x) for _, x in plan)
+            if not messagebox.askyesno(
+                    "Keep the largest",
+                    f"Keep the largest image in each of {len(plan)} groups and send the other "
+                    f"{extras} to the Recycle Bin?\nYou can restore them from there.", parent=win):
+                return
+            done, failed, freed = self.delete_dups(plan)
+            messagebox.showinfo("Done", f"Sent {done} files to the Recycle Bin "
+                                f"({freed / 1048576:.1f} MB).\nFailed: {failed}", parent=win)
+            st["groups"] = []
+            fill_groups()
+
+        def poll():
+            job = st["job"]
+            if not job:
+                return
+            q = job[0]
+            finished = False
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    if msg[0] == "total":
+                        bar.config(maximum=max(1, msg[1]), value=0)
+                        status.config(text=f"Analysing {msg[1]} new images…" if msg[1]
+                                      else "Comparing images…")
+                    elif msg[0] == "progress":
+                        bar.config(value=msg[1])
+                    elif msg[0] == "searching":
+                        bar.config(value=bar.cget("maximum"))
+                        status.config(text="Comparing images…")
+                    elif msg[0] == "groups":
+                        st["groups"] = msg[1]
+                        fill_groups()
+                        n = len(msg[1])
+                        status.config(text=f"Found {n} group{'s' if n != 1 else ''} of similar images."
+                                      if n else "No similar images found. Try a higher strictness.")
+                    elif msg[0] == "done":
+                        if msg[1]:
+                            status.config(text="Cancelled. Progress is kept.")
+                        finished = True
+                    elif msg[0] == "error":
+                        messagebox.showerror("Search failed", msg[1], parent=win)
+                        finished = True
+            except queue.Empty:
+                pass
+            if finished:
+                st["job"] = None
+                search_btn.config(state="normal")
+            else:
+                win.after(150, poll)
+
+        def search():
+            if st["job"]:
+                return
+            q, cancel = queue.Queue(), threading.Event()
+            st["job"] = (q, cancel)
+            search_btn.config(state="disabled")
+            status.config(text="Starting…")
+            threading.Thread(target=similar_worker, args=(str(DB_PATH), scale.get(), q, cancel),
+                             daemon=True).start()
+            poll()
+
+        def close():
+            if st["job"]:
+                st["job"][1].set()
+                st["job"] = None
+            win.destroy()
+            self.cache.clear()
+            self.refresh()
+
+        search_btn.config(command=search)
+        auto_btn.config(command=auto_all)
+        apply_btn.config(command=apply)
+        skip_btn.config(command=skip)
+        ttk.Button(action, text="Close", command=close).pack(side="right")
+        gl.bind("<<ListboxSelect>>", show_group)
+        win.protocol("WM_DELETE_WINDOW", close)
 
     # ---------- drag and drop (optional) ----------
     def setup_dnd(self):

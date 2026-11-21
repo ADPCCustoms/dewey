@@ -20,6 +20,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter, 0-5 rates, F toggles favourite, Esc closes.
 - **Sort**: newest, oldest, name A-Z / Z-A, highest rated, favourites first.
 - **Find duplicates**: lists exact copies, grouped into sets.
+- **Find similar**: finds look-alike images (the same picture resized, re-saved at another quality, or with slightly different brightness). Pick a strictness, review each group side by side, tick the ones to keep (the largest is ticked by default) and the rest go to the Recycle Bin. It does not detect rotated, flipped or heavily cropped copies.
 - **Delete duplicates**: choose which copy to keep, preview the sets, then send the extras to the Recycle Bin. Tags, favourite and rating are merged into the copy you keep.
 - **Clean up missing files**: remove library entries whose files have been deleted or moved (no image files are touched).
 - **Copy prompt**: copies the embedded prompt of the selected image to the clipboard.

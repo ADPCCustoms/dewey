@@ -1,8 +1,9 @@
-## What's new in v1.5
+## What's new in v1.6
 
-- Watch folders: pick folders (for example where your downloads land) and new images are added to the library automatically, once at startup and then every minute while the app is open. Manage them with the new Watch folders button
-- Drag and drop: drop folders or individual images onto the window to add them
-- Files that are still being downloaded are left until they have finished, so half-written images are not indexed
-- You can now add individual image files, not just whole folders
+- Find similar: finds near-duplicate images that exact-match duplicates miss, such as the same picture resized, re-saved at a different quality or with slightly changed brightness
+- A strictness slider controls how loose a match can be, and each group is shown side by side with its size and resolution
+- Keep the ones you want per group (the largest is ticked by default) and the rest go to the Recycle Bin, with tags, favourites and ratings merged into the kept image. Or keep the largest in every group in one step
+- Images are analysed once and remembered, so later searches are quick. Analysing also fills the thumbnail cache, so browsing is faster afterwards
+- Blank and flat-colour images are ignored so they are not grouped together
 
 Existing libraries upgrade automatically on first launch.

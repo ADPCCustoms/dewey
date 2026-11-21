@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6
+- Find similar: groups look-alike images (resized, re-saved, brightness changes) with a strictness slider
+- Side-by-side review per group; keep the largest by default, others to the Recycle Bin with tags merged
+- Images analysed once and remembered; analysis also warms the thumbnail cache
+- Blank and flat-colour images are ignored
+
 ## v1.5
 - Watch folders: new images in chosen folders are added automatically (at startup, then every minute)
 - Drag and drop folders or image files onto the window
