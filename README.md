@@ -15,7 +15,12 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Browse sidebar**: All images, Favourites, Rated 4+, Untagged, and every tag with its count. Click one to filter.
 - **Favourites and ratings**: mark a favourite (gold border in the grid) and give 0 to 5 stars, for one or many selected images.
 - **Rename in bulk**: patterns such as `{date}_{n:03}` using `{date}`, `{type}`, `{tag}`, `{name}` and a counter, with a preview first.
+- **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter, 0-5 rates, F toggles favourite, Esc closes.
+- **Sort**: newest, oldest, name A-Z / Z-A, highest rated, favourites first.
 - **Find duplicates**: lists exact copies, grouped into sets.
+- **Delete duplicates**: choose which copy to keep, preview the sets, then send the extras to the Recycle Bin. Tags, favourite and rating are merged into the copy you keep.
+- **Clean up missing files**: remove library entries whose files have been deleted or moved (no image files are touched).
+- **Copy prompt**: copies the embedded prompt of the selected image to the clipboard.
 - **Sort into folders**: copy or move the selected images, everything showing, or the whole library into a structure you pick:
   - Year / Month
   - Year only
@@ -58,7 +63,9 @@ Keep `library.db` alongside the exe. Rebuilding never touches the database.
 
 ## Publish to GitHub (Windows)
 
-`publish.bat` does everything in one go: asks for a version tag and short update notes, commits your changes, creates the GitHub repo on the first run (or pushes to it afterwards), builds the exe, and publishes it as a release with your notes and the exe's SHA256 checksum. It needs [Git](https://git-scm.com) and the [GitHub CLI](https://cli.github.com), and you must be signed in with `gh auth login`.
+Each version ships with three small files: `version.txt` (the tag, for example `v1.3`), `release-notes.md` (what's new in this version) and `CHANGELOG.md` (the running history). Running `publish.bat` then does everything: builds the exe, adds a SmartScreen note and the exe's SHA256 checksum to the release notes, commits and pushes the code, and publishes the release. It stops early if that version already exists on GitHub.
+
+It needs [Git](https://git-scm.com) and the [GitHub CLI](https://cli.github.com), and you must be signed in with `gh auth login`.
 
 ## Windows SmartScreen warning
 

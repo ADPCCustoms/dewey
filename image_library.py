@@ -50,6 +50,44 @@ def unique_path(target):
         n += 1
 
 
+_P = "replace(path, '/', '\\')"
+NAME_SQL = f"replace({_P}, rtrim({_P}, replace({_P}, '\\', '')), '')"
+SORTS = {
+    "Newest first": " ORDER BY taken DESC, id",
+    "Oldest first": " ORDER BY taken ASC, id",
+    "Name A–Z": f" ORDER BY {NAME_SQL} COLLATE NOCASE ASC, id",
+    "Name Z–A": f" ORDER BY {NAME_SQL} COLLATE NOCASE DESC, id",
+    "Highest rated": " ORDER BY rating DESC, fav DESC, taken DESC, id",
+    "Favourites first": " ORDER BY fav DESC, rating DESC, taken DESC, id",
+}
+
+
+def to_recycle_bin(path):
+    """Send a file to the Windows Recycle Bin (recoverable). Raises OSError on failure."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                        ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+        op = SHFILEOPSTRUCTW()
+        op.wFunc = 3  # FO_DELETE
+        op.pFrom = str(Path(path).resolve()) + "\0"  # list must end with a double null
+        op.fFlags = 0x40 | 0x10 | 0x4 | 0x400  # undo, no confirm, silent, no error UI
+        if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) != 0 or op.fAnyOperationsAborted:
+            raise OSError("Could not move the file to the Recycle Bin")
+    else:
+        try:
+            from send2trash import send2trash
+        except ImportError:
+            raise OSError("Install send2trash to use the Recycle Bin on this system")
+        send2trash(str(path))
+
+
 COL_SEL, COL_FAV = "#3b82f6", "#f5c518"
 
 
@@ -139,6 +177,19 @@ class App:
         self.status = ttk.Label(top, text="")
         self.status.pack(side="right")
 
+        top2 = ttk.Frame(self.root)
+        top2.pack(fill="x", padx=8)
+        ttk.Label(top2, text="Sort:").pack(side="left")
+        self.sort_var = tk.StringVar(value="Newest first")
+        sc = ttk.Combobox(top2, textvariable=self.sort_var, width=16, state="readonly",
+                          values=list(SORTS))
+        sc.pack(side="left", padx=4)
+        sc.bind("<<ComboboxSelected>>", lambda e: self.reset_page())
+        ttk.Button(top2, text="Clean up missing files…", command=self.cleanup_missing).pack(
+            side="left", padx=(12, 4))
+        ttk.Button(top2, text="Delete duplicates…", command=self.delete_duplicates_dialog).pack(
+            side="left")
+
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=8)
 
@@ -182,9 +233,13 @@ class App:
         rc.bind("<<ComboboxSelected>>", lambda e: self.apply_rating())
         row = ttk.Frame(d)
         row.pack(fill="x")
-        ttk.Button(row, text="Open", command=self.open_file).pack(side="left")
-        ttk.Button(row, text="Show in folder", command=self.show_in_folder).pack(side="left", padx=4)
-        ttk.Label(d, text="Prompt / metadata:").pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="View", command=lambda: self.open_viewer(self.primary)).pack(side="left")
+        ttk.Button(row, text="Open", command=self.open_file).pack(side="left", padx=4)
+        ttk.Button(row, text="Show in folder", command=self.show_in_folder).pack(side="left")
+        prow = ttk.Frame(d)
+        prow.pack(fill="x", pady=(8, 0))
+        ttk.Label(prow, text="Prompt / metadata:").pack(side="left")
+        ttk.Button(prow, text="Copy", command=self.copy_prompt).pack(side="right")
         self.prompt = tk.Text(d, height=8, wrap="word", state="disabled")
         self.prompt.pack(fill="both", expand=True)
 
@@ -264,7 +319,7 @@ class App:
         w, p = self.where()
         self.total = self.db.execute("SELECT COUNT(*) FROM images" + w, p).fetchone()[0]
         self.rows = self.db.execute(
-            "SELECT id, path, fav FROM images" + w + " ORDER BY taken DESC LIMIT ? OFFSET ?",
+            "SELECT id, path, fav FROM images" + w + SORTS[self.sort_var.get()] + " LIMIT ? OFFSET ?",
             p + [PAGE, self.page * PAGE]).fetchall()
         pages = max(1, (self.total + PAGE - 1) // PAGE)
         self.page_label.config(text=f"Page {self.page + 1} of {pages}  ({self.total} images)")
@@ -297,6 +352,7 @@ class App:
                            cursor="hand2")
             lbl.grid(row=n // self.cols, column=n % self.cols, padx=3, pady=3)
             lbl.bind("<Button-1>", lambda e, i=iid: self.on_click(e, i))
+            lbl.bind("<Double-Button-1>", lambda e, i=iid: self.open_viewer(i))
             self.widgets[iid] = lbl
         self.recolor()
         self.canvas.yview_moveto(0)
@@ -531,6 +587,219 @@ class App:
         self.db.commit()
         self.status.config(text=f"Marked {self.total} as {kind}")
         self.refresh()
+
+    # ---------- full-size viewer ----------
+    def copy_prompt(self):
+        text = self.prompt.get("1.0", "end").strip()
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.status.config(text="Prompt copied")
+
+    def open_viewer(self, start_id=None):
+        w, p = self.where()
+        items = self.db.execute("SELECT id, path FROM images" + w + SORTS[self.sort_var.get()],
+                                p).fetchall()
+        if not items:
+            return
+        idx = next((n for n, r in enumerate(items) if r[0] == start_id), 0)
+        win = tk.Toplevel(self.root)
+        win.geometry("1000x760")
+        win.configure(bg="black")
+        tk.Label(win, text="← → browse    0-5 rate    F favourite    Esc close",
+                 bg="black", fg="#888888").pack(side="bottom")
+        lbl = tk.Label(win, bg="black", fg="white")
+        lbl.pack(fill="both", expand=True)
+        st = {"i": idx, "img": None, "size": (0, 0), "job": None}
+
+        def show():
+            iid, path = items[st["i"]]
+            fav, rating = self.db.execute("SELECT fav, rating FROM images WHERE id=?",
+                                          (iid,)).fetchone()
+            try:
+                img = Image.open(path).convert("RGB")
+                img.thumbnail((max(200, win.winfo_width() - 4), max(200, win.winfo_height() - 30)))
+                st["img"] = ImageTk.PhotoImage(img)
+                lbl.config(image=st["img"], text="")
+            except Exception:
+                lbl.config(image="", text="(file missing)")
+            win.title(f"{Path(path).name}    {st['i'] + 1} / {len(items)}    "
+                      f"{'♥ ' if fav else ''}{'★' * (rating or 0)}")
+
+        def go(delta=None, to=None):
+            n = st["i"] + delta if delta is not None else to
+            st["i"] = min(max(n, 0), len(items) - 1)
+            show()
+
+        def on_key(e):
+            iid = items[st["i"]][0]
+            if e.char and e.char in "012345":
+                self.db.execute("UPDATE images SET rating=? WHERE id=?", (int(e.char), iid))
+            elif e.char and e.char.lower() == "f":
+                self.db.execute("UPDATE images SET fav=1-fav WHERE id=?", (iid,))
+            else:
+                return
+            self.db.commit()
+            show()
+
+        def close():
+            win.destroy()
+            self.refresh()
+
+        def on_resize(e):
+            if e.widget is win and (e.width, e.height) != st["size"]:
+                st["size"] = (e.width, e.height)
+                if st["job"]:
+                    win.after_cancel(st["job"])
+                st["job"] = win.after(150, show)
+
+        win.bind("<Right>", lambda e: go(1))
+        win.bind("<space>", lambda e: go(1))
+        win.bind("<Left>", lambda e: go(-1))
+        win.bind("<Home>", lambda e: go(to=0))
+        win.bind("<End>", lambda e: go(to=len(items) - 1))
+        win.bind("<Escape>", lambda e: close())
+        win.bind("<Key>", on_key)
+        win.bind("<Configure>", on_resize)
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.focus_force()
+        win.after(100, show)
+
+    # ---------- housekeeping ----------
+    def missing_ids(self):
+        return [i for i, p in self.db.execute("SELECT id, path FROM images").fetchall()
+                if not os.path.exists(p)]
+
+    def remove_entries(self, ids):
+        self.db.executemany("DELETE FROM tags WHERE image_id=?", [(i,) for i in ids])
+        self.db.executemany("DELETE FROM images WHERE id=?", [(i,) for i in ids])
+        self.db.commit()
+
+    def cleanup_missing(self):
+        total = self.db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        missing = self.missing_ids()
+        if not missing:
+            messagebox.showinfo("Clean up", "No missing files found. Everything in the library still exists.")
+            return
+        warn = ("\n\nWARNING: every file looks missing. Is an external drive disconnected?"
+                if len(missing) == total else "")
+        if not messagebox.askyesno(
+                "Clean up",
+                f"{len(missing)} library entries point to files that no longer exist.\n"
+                f"Remove them from the library? No image files are touched.{warn}"):
+            return
+        self.remove_entries(missing)
+        self.status.config(text=f"Removed {len(missing)} missing entries")
+        self.cache.clear()
+        self.refresh()
+
+    def dup_plan(self, mode):
+        """Return [(keeper, [extras])] for exact duplicates; each item is (id, path)."""
+        groups = {}
+        for iid, path, h in self.db.execute(
+                "SELECT id, path, hash FROM images WHERE hash IN "
+                "(SELECT hash FROM images GROUP BY hash HAVING COUNT(*) > 1) ORDER BY hash, id"):
+            if os.path.exists(path):
+                groups.setdefault(h, []).append((iid, path))
+        plan = []
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            if mode == "short":
+                keep = min(g, key=lambda r: (len(r[1]), r[0]))
+            elif mode == "oldest":
+                keep = min(g, key=lambda r: (os.path.getmtime(r[1]), r[0]))
+            else:
+                keep = min(g, key=lambda r: r[0])
+            plan.append((keep, [r for r in g if r is not keep]))
+        return plan
+
+    def delete_dups(self, plan):
+        """Recycle the extra copies; tags, favourite and rating are merged into the kept copy."""
+        done = failed = freed = 0
+        for keep, others in plan:
+            for iid, path in others:
+                try:
+                    size = os.path.getsize(path)
+                    to_recycle_bin(path)
+                except OSError:
+                    failed += 1
+                    continue
+                self.db.execute("INSERT OR IGNORE INTO tags SELECT ?, tag FROM tags WHERE image_id=?",
+                                (keep[0], iid))
+                self.db.execute(
+                    "UPDATE images SET fav=MAX(fav, (SELECT fav FROM images WHERE id=?)), "
+                    "rating=MAX(rating, (SELECT rating FROM images WHERE id=?)) WHERE id=?",
+                    (iid, iid, keep[0]))
+                self.db.execute("DELETE FROM tags WHERE image_id=?", (iid,))
+                self.db.execute("DELETE FROM images WHERE id=?", (iid,))
+                freed += size
+                done += 1
+        self.db.commit()
+        return done, failed, freed
+
+    def delete_duplicates_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Delete duplicates")
+        win.geometry("760x600")
+        win.transient(self.root)
+        win.grab_set()
+        mode_var = tk.StringVar(value="first")
+        ttk.Label(win, text="Which copy do you want to keep?",
+                  font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        for value, text in [("first", "The one added to the library first"),
+                            ("short", "The one with the shortest path (often the original)"),
+                            ("oldest", "The oldest file (by modified date)")]:
+            ttk.Radiobutton(win, text=text, variable=mode_var, value=value,
+                            command=lambda: preview()).pack(anchor="w", padx=24)
+        ttk.Label(win, text="Preview", font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        box = tk.Text(win, wrap="none", state="disabled")
+        box.pack(fill="both", expand=True, padx=12)
+        status = ttk.Label(win, text="")
+        status.pack(anchor="w", padx=12, pady=4)
+
+        def preview():
+            plan = self.dup_plan(mode_var.get())
+            extras = sum(len(x) for _, x in plan)
+            size = sum(os.path.getsize(path) for _, x in plan for _, path in x if os.path.exists(path))
+            box.config(state="normal")
+            box.delete("1.0", "end")
+            if not plan:
+                box.insert("end", "No duplicate files found.")
+            for keep, others in plan[:80]:
+                box.insert("end", f"KEEP    {keep[1]}\n")
+                for _, path in others:
+                    box.insert("end", f"delete  {path}\n")
+                box.insert("end", "\n")
+            if len(plan) > 80:
+                box.insert("end", f"... and {len(plan) - 80} more sets\n")
+            box.config(state="disabled")
+            status.config(text=f"{extras} extra copies in {len(plan)} sets, about {size / 1048576:.1f} MB")
+
+        def run():
+            plan = self.dup_plan(mode_var.get())
+            extras = sum(len(x) for _, x in plan)
+            if not extras:
+                return
+            if not messagebox.askyesno(
+                    "Delete duplicates",
+                    f"Send {extras} extra copies to the Recycle Bin?\n"
+                    "You can restore them from there. Tags, favourites and ratings are kept on the copy you keep.",
+                    parent=win):
+                return
+            done, failed, freed = self.delete_dups(plan)
+            messagebox.showinfo("Delete duplicates",
+                                f"Sent {done} files to the Recycle Bin ({freed / 1048576:.1f} MB).\n"
+                                f"Failed: {failed}", parent=win)
+            win.destroy()
+            self.cache.clear()
+            self.refresh()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="Send extras to Recycle Bin", command=run).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+        preview()
 
     # ---------- bulk rename ----------
     def rename_dialog(self):
