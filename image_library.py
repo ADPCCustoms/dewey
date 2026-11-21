@@ -1,7 +1,7 @@
 """Image Library - index, tag and search your images. Files are never moved or changed.
 Requires: pip install pillow
 """
-import hashlib, os, shutil, sqlite3, subprocess, sys
+import hashlib, os, re, shutil, sqlite3, subprocess, sys
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
@@ -50,6 +50,17 @@ def unique_path(target):
         n += 1
 
 
+COL_SEL, COL_FAV = "#3b82f6", "#f5c518"
+
+
+def build_name(pattern, n, taken, kind, tag, stem):
+    """Expand a rename pattern: {date} {type} {tag} {name} {n} {n:03}"""
+    s = re.sub(r"\{n(?::(\d+))?\}", lambda m: str(n).zfill(int(m.group(1) or 0)), pattern)
+    s = (s.replace("{date}", taken[:10]).replace("{type}", kind)
+          .replace("{tag}", tag or "untagged").replace("{name}", stem))
+    return safe_name(s)
+
+
 # Markers some AI tools leave in a file's embedded metadata (IPTC/XMP "digital source type")
 AI_MARKERS = (b"trainedAlgorithmicMedia", b"Made with Google AI")
 
@@ -85,12 +96,20 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Image Library")
-        root.geometry("1200x720")
+        root.geometry("1280x740")
         self.db = sqlite3.connect(DB_PATH)
         self.db.executescript(SCHEMA)
+        for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0"):
+            try:
+                self.db.execute(f"ALTER TABLE images ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self.page, self.rows, self.total = 0, [], 0
         self.cache, self.cols = {}, 5
-        self.sel_id, self.sel_path, self.sel_widget = None, None, None
+        self.normal_bg = root.cget("bg")
+        self.selected, self.primary, self.anchor = set(), None, None
+        self.sel_path, self.widgets = None, {}
+        self.side_filter, self.side_items = ("all", None), []
         self.debounce = None
         self.build_ui()
         self.refresh()
@@ -123,6 +142,15 @@ class App:
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=8)
 
+        # browse sidebar (left)
+        side = ttk.Frame(main, width=190)
+        side.pack(side="left", fill="y", padx=(0, 8))
+        side.pack_propagate(False)
+        ttk.Label(side, text="Browse", font=("", 10, "bold")).pack(anchor="w")
+        self.side_list = tk.Listbox(side, exportselection=False, activestyle="none")
+        self.side_list.pack(fill="both", expand=True)
+        self.side_list.bind("<<ListboxSelect>>", self.on_side_select)
+
         # detail panel (right)
         d = ttk.Frame(main, width=310)
         d.pack(side="right", fill="y", padx=(8, 0))
@@ -136,7 +164,22 @@ class App:
         te = ttk.Entry(d, textvariable=self.tags_var)
         te.pack(fill="x")
         te.bind("<Return>", lambda e: self.save_tags())
-        ttk.Button(d, text="Save tags", command=self.save_tags).pack(anchor="w", pady=4)
+        trow = ttk.Frame(d)
+        trow.pack(fill="x", pady=4)
+        ttk.Button(trow, text="Save", command=self.save_tags).pack(side="left")
+        ttk.Button(trow, text="Add to all selected", command=self.add_tags_selected).pack(side="left", padx=4)
+        ttk.Button(trow, text="Remove", command=self.remove_tags_selected).pack(side="left")
+        frow = ttk.Frame(d)
+        frow.pack(fill="x", pady=(0, 4))
+        self.fav_var = tk.BooleanVar()
+        self.rating_var = tk.StringVar(value="0")
+        ttk.Checkbutton(frow, text="♥ Favourite", variable=self.fav_var,
+                        command=self.apply_fav).pack(side="left")
+        ttk.Label(frow, text="   Rating:").pack(side="left")
+        rc = ttk.Combobox(frow, textvariable=self.rating_var, width=3, state="readonly",
+                          values=["0", "1", "2", "3", "4", "5"])
+        rc.pack(side="left")
+        rc.bind("<<ComboboxSelected>>", lambda e: self.apply_rating())
         row = ttk.Frame(d)
         row.pack(fill="x")
         ttk.Button(row, text="Open", command=self.open_file).pack(side="left")
@@ -167,6 +210,12 @@ class App:
         self.page_label = ttk.Label(pager, text="")
         self.page_label.pack(side="left")
         ttk.Button(pager, text="Next ▶", command=lambda: self.change_page(1)).pack(side="left", padx=8)
+        self.sel_label = ttk.Label(pager, text="")
+        self.sel_label.pack(side="left", padx=12)
+        ttk.Button(pager, text="Select page", command=self.select_page).pack(side="left")
+        ttk.Button(pager, text="Clear selection", command=self.clear_selection).pack(side="left", padx=4)
+        ttk.Button(pager, text="Rename…", command=self.rename_dialog).pack(side="left")
+        ttk.Label(pager, text="Ctrl-click / Shift-click to select several").pack(side="right", padx=8)
 
     def on_resize(self, event):
         cols = max(1, event.width // (THUMB + 16))
@@ -182,6 +231,16 @@ class App:
     # ---------- data ----------
     def where(self):
         sql, params = " WHERE 1=1", []
+        mode, val = self.side_filter
+        if mode == "fav":
+            sql += " AND fav=1"
+        elif mode == "rated":
+            sql += " AND rating>=4"
+        elif mode == "untagged":
+            sql += " AND id NOT IN (SELECT image_id FROM tags)"
+        elif mode == "tag":
+            sql += " AND id IN (SELECT image_id FROM tags WHERE tag=?)"
+            params.append(val)
         if self.kind_var.get() != "all":
             sql += " AND kind=?"
             params.append(self.kind_var.get())
@@ -205,11 +264,16 @@ class App:
         w, p = self.where()
         self.total = self.db.execute("SELECT COUNT(*) FROM images" + w, p).fetchone()[0]
         self.rows = self.db.execute(
-            "SELECT id, path FROM images" + w + " ORDER BY taken DESC LIMIT ? OFFSET ?",
+            "SELECT id, path, fav FROM images" + w + " ORDER BY taken DESC LIMIT ? OFFSET ?",
             p + [PAGE, self.page * PAGE]).fetchall()
         pages = max(1, (self.total + PAGE - 1) // PAGE)
         self.page_label.config(text=f"Page {self.page + 1} of {pages}  ({self.total} images)")
         self.render()
+        self.selected &= {r[0] for r in self.rows}
+        if self.primary not in self.selected:
+            self.primary = next(iter(self.selected), None)
+        self.update_selection()
+        self.refresh_sidebar()
 
     def thumb(self, path):
         if path in self.cache:
@@ -227,27 +291,107 @@ class App:
     def render(self):
         for w in self.grid_frame.winfo_children():
             w.destroy()
-        self.sel_widget = None
-        for n, (iid, path) in enumerate(self.rows):
-            lbl = tk.Label(self.grid_frame, image=self.thumb(path), bd=3, cursor="hand2")
-            lbl.grid(row=n // self.cols, column=n % self.cols, padx=4, pady=4)
-            lbl.bind("<Button-1>", lambda e, i=iid, p=path, w=lbl: self.select(i, p, w))
-            if iid == self.sel_id:
-                lbl.config(relief="solid")
-                self.sel_widget = lbl
+        self.widgets = {}
+        for n, (iid, path, fav) in enumerate(self.rows):
+            lbl = tk.Label(self.grid_frame, image=self.thumb(path), bd=0, padx=3, pady=3,
+                           cursor="hand2")
+            lbl.grid(row=n // self.cols, column=n % self.cols, padx=3, pady=3)
+            lbl.bind("<Button-1>", lambda e, i=iid: self.on_click(e, i))
+            self.widgets[iid] = lbl
+        self.recolor()
         self.canvas.yview_moveto(0)
 
-    # ---------- selection / tags ----------
-    def select(self, iid, path, widget):
-        if self.sel_widget is not None:
-            try:
-                self.sel_widget.config(relief="flat")
-            except tk.TclError:
-                pass
-        widget.config(relief="solid")
-        self.sel_id, self.sel_path, self.sel_widget = iid, path, widget
-        taken, kind, prompt = self.db.execute(
-            "SELECT taken, kind, prompt FROM images WHERE id=?", (iid,)).fetchone()
+    def recolor(self):
+        for iid, _, fav in self.rows:
+            w = self.widgets.get(iid)
+            if w is not None:
+                w.config(bg=COL_SEL if iid in self.selected
+                         else COL_FAV if fav else self.normal_bg)
+
+    # ---------- sidebar ----------
+    def refresh_sidebar(self):
+        def count(sql):
+            return self.db.execute(sql).fetchone()[0]
+        items = [
+            ("All images", ("all", None), count("SELECT COUNT(*) FROM images")),
+            ("♥ Favourites", ("fav", None), count("SELECT COUNT(*) FROM images WHERE fav=1")),
+            ("★ Rated 4+", ("rated", None), count("SELECT COUNT(*) FROM images WHERE rating>=4")),
+            ("Untagged", ("untagged", None),
+             count("SELECT COUNT(*) FROM images WHERE id NOT IN (SELECT image_id FROM tags)")),
+        ]
+        for tag, n in self.db.execute("SELECT tag, COUNT(*) FROM tags GROUP BY tag ORDER BY tag"):
+            items.append((f"# {tag}", ("tag", tag), n))
+        self.side_items = items
+        self.side_list.delete(0, "end")
+        chosen = None
+        for n, (label, key, cnt) in enumerate(items):
+            self.side_list.insert("end", f"{label}  ({cnt})")
+            if key == self.side_filter:
+                chosen = n
+        if chosen is None:
+            self.side_filter, chosen = ("all", None), 0
+        self.side_list.selection_set(chosen)
+
+    def on_side_select(self, event=None):
+        sel = self.side_list.curselection()
+        if sel:
+            self.side_filter = self.side_items[sel[0]][1]
+            self.reset_page()
+
+    # ---------- selection ----------
+    def on_click(self, event, iid):
+        ids = [r[0] for r in self.rows]
+        shift, ctrl = event.state & 0x1, event.state & 0x4
+        if shift and self.anchor in ids:
+            a, b = sorted((ids.index(self.anchor), ids.index(iid)))
+            self.selected = set(ids[a:b + 1])
+        elif ctrl:
+            self.selected ^= {iid}
+            self.anchor = iid
+        else:
+            self.selected = {iid}
+            self.anchor = iid
+        if iid in self.selected:
+            self.primary = iid
+        else:
+            self.primary = next(iter(self.selected), None)
+        self.update_selection()
+
+    def select_page(self):
+        self.selected = {r[0] for r in self.rows}
+        self.primary = self.rows[0][0] if self.rows else None
+        self.update_selection()
+
+    def clear_selection(self):
+        self.selected, self.primary = set(), None
+        self.update_selection()
+
+    def update_selection(self):
+        self.recolor()
+        n = len(self.selected)
+        self.sel_label.config(text=f"{n} selected" if n else "")
+        self.show_detail(self.primary)
+
+    def set_prompt(self, text):
+        self.prompt.config(state="normal")
+        self.prompt.delete("1.0", "end")
+        self.prompt.insert("1.0", text)
+        self.prompt.config(state="disabled")
+
+    def show_detail(self, iid):
+        if iid is None:
+            self.sel_path = None
+            self.preview.config(image="", text="Select an image")
+            self.info.config(text="")
+            self.tags_var.set("")
+            self.fav_var.set(False)
+            self.rating_var.set("0")
+            self.set_prompt("")
+            return
+        path, taken, kind, prompt, fav, rating = self.db.execute(
+            "SELECT path, taken, kind, prompt, fav, rating FROM images WHERE id=?",
+            (iid,)).fetchone()
+        self.sel_path = path
         try:
             img = Image.open(path).convert("RGB")
             img.thumbnail((290, 260))
@@ -255,24 +399,83 @@ class App:
             self.preview.config(image=self._preview_img, text="")
         except Exception:
             self.preview.config(image="", text="(file missing)")
-        self.info.config(text=f"{Path(path).name}\n{kind} · {taken[:10]}\n{path}")
+        extra = f"\n{len(self.selected)} images selected" if len(self.selected) > 1 else ""
+        self.info.config(text=f"{Path(path).name}\n{kind} · {taken[:10]}\n{path}{extra}")
         tags = [r[0] for r in self.db.execute(
             "SELECT tag FROM tags WHERE image_id=? ORDER BY tag", (iid,))]
         self.tags_var.set(", ".join(tags))
-        self.prompt.config(state="normal")
-        self.prompt.delete("1.0", "end")
-        self.prompt.insert("1.0", prompt or "")
-        self.prompt.config(state="disabled")
+        self.fav_var.set(bool(fav))
+        self.rating_var.set(str(rating or 0))
+        self.set_prompt(prompt or "")
+
+    # ---------- tags, favourites, ratings ----------
+    def parse_tags(self):
+        return {t.strip().lower() for t in self.tags_var.get().split(",") if t.strip()}
 
     def save_tags(self):
-        if self.sel_id is None:
+        """Replace the tags of the main (last clicked) image."""
+        if self.primary is None:
             return
-        tags = {t.strip().lower() for t in self.tags_var.get().split(",") if t.strip()}
-        self.db.execute("DELETE FROM tags WHERE image_id=?", (self.sel_id,))
+        self.db.execute("DELETE FROM tags WHERE image_id=?", (self.primary,))
         self.db.executemany("INSERT OR IGNORE INTO tags VALUES(?,?)",
-                            [(self.sel_id, t) for t in tags])
+                            [(self.primary, t) for t in self.parse_tags()])
         self.db.commit()
         self.status.config(text="Tags saved")
+        self.after_tag_change()
+
+    def add_tags_selected(self):
+        tags = self.parse_tags()
+        if not self.selected or not tags:
+            return
+        self.db.executemany("INSERT OR IGNORE INTO tags VALUES(?,?)",
+                            [(i, t) for i in self.selected for t in tags])
+        self.db.commit()
+        self.status.config(text=f"Added to {len(self.selected)} images")
+        self.after_tag_change()
+
+    def remove_tags_selected(self):
+        tags = self.parse_tags()
+        if not self.selected or not tags:
+            return
+        self.db.executemany("DELETE FROM tags WHERE image_id=? AND tag=?",
+                            [(i, t) for i in self.selected for t in tags])
+        self.db.commit()
+        self.status.config(text=f"Removed from {len(self.selected)} images")
+        self.after_tag_change()
+
+    def after_tag_change(self):
+        if self.side_filter[0] in ("tag", "untagged") or self.search_var.get().strip():
+            self.refresh()
+        else:
+            self.refresh_sidebar()
+            self.show_detail(self.primary)
+
+    def apply_fav(self):
+        if not self.selected:
+            return
+        v = int(self.fav_var.get())
+        ids = list(self.selected)
+        self.db.execute(f"UPDATE images SET fav=? WHERE id IN ({','.join('?' * len(ids))})",
+                        [v] + ids)
+        self.db.commit()
+        self.rows = [(i, p, v if i in self.selected else f) for i, p, f in self.rows]
+        self.recolor()
+        if self.side_filter[0] == "fav":
+            self.refresh()
+        else:
+            self.refresh_sidebar()
+
+    def apply_rating(self):
+        if not self.selected:
+            return
+        ids = list(self.selected)
+        self.db.execute(f"UPDATE images SET rating=? WHERE id IN ({','.join('?' * len(ids))})",
+                        [int(self.rating_var.get())] + ids)
+        self.db.commit()
+        if self.side_filter[0] == "rated":
+            self.refresh()
+        else:
+            self.refresh_sidebar()
 
     def open_file(self):
         if self.sel_path and os.path.exists(self.sel_path):
@@ -329,8 +532,128 @@ class App:
         self.status.config(text=f"Marked {self.total} as {kind}")
         self.refresh()
 
+    # ---------- bulk rename ----------
+    def rename_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Rename images")
+        win.geometry("620x560")
+        win.transient(self.root)
+        win.grab_set()
+        scope_var = tk.StringVar(value="selected" if self.selected else "current")
+        pat_var = tk.StringVar(value="{date}_{n:03}")
+        start_var = tk.StringVar(value="1")
+
+        def heading(text):
+            ttk.Label(win, text=text, font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+
+        heading("Which images?")
+        for value, text in [("selected", "Only the selected images"),
+                            ("current", "Everything showing now (current search / filter)")]:
+            ttk.Radiobutton(win, text=text, variable=scope_var, value=value).pack(anchor="w", padx=24)
+        heading("New name pattern")
+        ttk.Entry(win, textvariable=pat_var).pack(fill="x", padx=12)
+        ttk.Label(win, justify="left", text=(
+            "{date} taken date    {type} photo / ai / other    {tag} first tag\n"
+            "{name} original name    {n} counter    {n:03} counter padded to 3 digits"
+        )).pack(anchor="w", padx=12, pady=4)
+        srow = ttk.Frame(win)
+        srow.pack(fill="x", padx=12)
+        ttk.Label(srow, text="Counter starts at:").pack(side="left")
+        ttk.Entry(srow, textvariable=start_var, width=6).pack(side="left", padx=6)
+        heading("Preview")
+        box = tk.Text(win, height=12, wrap="none", state="disabled")
+        box.pack(fill="both", expand=True, padx=12)
+        status = ttk.Label(win, text="")
+        status.pack(anchor="w", padx=12, pady=4)
+
+        def first_tag(iid):
+            t = self.db.execute("SELECT tag FROM tags WHERE image_id=? ORDER BY tag LIMIT 1",
+                                (iid,)).fetchone()
+            return t[0] if t else ""
+
+        def get_rows():
+            if scope_var.get() == "selected":
+                ids = list(self.selected)
+                if not ids:
+                    return []
+                return self.db.execute(
+                    f"SELECT id, path, taken, kind FROM images WHERE id IN ({','.join('?' * len(ids))})"
+                    " ORDER BY taken, path", ids).fetchall()
+            w, p = self.where()
+            return self.db.execute("SELECT id, path, taken, kind FROM images" + w +
+                                   " ORDER BY taken, path", p).fetchall()
+
+        def plan():
+            try:
+                start = int(start_var.get())
+            except ValueError:
+                start = 1
+            out = []
+            for k, r in enumerate(get_rows()):
+                src = Path(r[1])
+                new = build_name(pat_var.get(), start + k, r[2], r[3], first_tag(r[0]), src.stem)
+                out.append((r[0], src, src.with_name(new + src.suffix)))
+            return out
+
+        def preview():
+            items = plan()
+            box.config(state="normal")
+            box.delete("1.0", "end")
+            if not items:
+                box.insert("end", "No images to rename.")
+            for _, src, tgt in items[:15]:
+                box.insert("end", f"{src.name}  →  {tgt.name}\n")
+            if len(items) > 15:
+                box.insert("end", f"... and {len(items) - 15} more\n")
+            box.config(state="disabled")
+            status.config(text=f"{len(items)} files (a name that already exists gets _1, _2 added)")
+
+        def run():
+            items = plan()
+            if not items:
+                return
+            if not messagebox.askyesno(
+                    "Rename files",
+                    f"Rename {len(items)} files on disk?\nThis changes the real filenames.",
+                    parent=win):
+                return
+            done = missing = failed = 0
+            for iid, src, tgt in items:
+                if not src.exists():
+                    missing += 1
+                    continue
+                if tgt == src:
+                    continue
+                try:
+                    tgt = unique_path(tgt)
+                    src.rename(tgt)
+                    self.db.execute("UPDATE images SET path=? WHERE id=?", (str(tgt), iid))
+                    done += 1
+                except (OSError, sqlite3.IntegrityError):
+                    failed += 1
+            self.db.commit()
+            messagebox.showinfo("Rename finished",
+                                f"Renamed {done} files.\nMissing skipped: {missing}\nFailed: {failed}",
+                                parent=win)
+            win.destroy()
+            self.cache.clear()
+            self.refresh()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="Preview", command=preview).pack(side="left")
+        ttk.Button(btns, text="Rename", command=run).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+
     # ---------- sort into folders ----------
     def sort_rows(self, scope):
+        if scope == "selected":
+            ids = list(self.selected)
+            if not ids:
+                return []
+            return self.db.execute(
+                f"SELECT id, path, taken, kind FROM images WHERE id IN ({','.join('?' * len(ids))})",
+                ids).fetchall()
         w, p = self.where() if scope == "current" else ("", [])
         return self.db.execute("SELECT id, path, taken, kind FROM images" + w, p).fetchall()
 
@@ -356,7 +679,7 @@ class App:
         win.geometry("560x640")
         win.transient(self.root)
         win.grab_set()
-        scope_var = tk.StringVar(value="current")
+        scope_var = tk.StringVar(value="selected" if self.selected else "current")
         mode_var = tk.StringVar(value="ym")
         action_var = tk.StringVar(value="copy")
         dest_var = tk.StringVar()
@@ -369,7 +692,8 @@ class App:
                 ttk.Radiobutton(win, text=text, variable=var, value=value).pack(anchor="w", padx=24)
 
         heading("Which images?")
-        radios(scope_var, [("current", "Only what's showing now (current search / filter)"),
+        radios(scope_var, [("selected", "Only the selected images"),
+                           ("current", "Everything showing now (current search / filter)"),
                            ("all", "Whole library")])
         heading("Folder structure")
         radios(mode_var, SORT_MODES)

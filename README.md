@@ -10,9 +10,13 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
 - **Search** by filename, prompt text or tag. Several words must all match.
 - **Filter by type**: photo, ai or other.
-- **Tags**: add comma-separated tags to any image.
+- **Select several images**: click, Ctrl-click to add or remove one, Shift-click for a range, or **Select page**.
+- **Tags**: add comma-separated tags to one image, or use **Add to all selected** / **Remove** to tag many at once.
+- **Browse sidebar**: All images, Favourites, Rated 4+, Untagged, and every tag with its count. Click one to filter.
+- **Favourites and ratings**: mark a favourite (gold border in the grid) and give 0 to 5 stars, for one or many selected images.
+- **Rename in bulk**: patterns such as `{date}_{n:03}` using `{date}`, `{type}`, `{tag}`, `{name}` and a counter, with a preview first.
 - **Find duplicates**: lists exact copies, grouped into sets.
-- **Sort into folders**: copy or move images into a structure you pick:
+- **Sort into folders**: copy or move the selected images, everything showing, or the whole library into a structure you pick:
   - Year / Month
   - Year only
   - Type (Photos, AI Images, Other)
