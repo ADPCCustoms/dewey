@@ -58,7 +58,19 @@ Keep `library.db` alongside the exe. Rebuilding never touches the database.
 
 ## Publish to GitHub (Windows)
 
-`publish.bat` does everything in one go: commits your changes, creates the GitHub repo on the first run (or pushes to it afterwards), builds the exe, and publishes it as a release. It needs [Git](https://git-scm.com) and the [GitHub CLI](https://cli.github.com), and you must be signed in with `gh auth login`.
+`publish.bat` does everything in one go: asks for a version tag and short update notes, commits your changes, creates the GitHub repo on the first run (or pushes to it afterwards), builds the exe, and publishes it as a release with your notes and the exe's SHA256 checksum. It needs [Git](https://git-scm.com) and the [GitHub CLI](https://cli.github.com), and you must be signed in with `gh auth login`.
+
+## Windows SmartScreen warning
+
+The exe isn't code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**. To check a download is the file that was published, compare its checksum with the SHA256 in the release notes:
+
+```
+Get-FileHash .\ImageLibrary.exe -Algorithm SHA256
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
 
 ## How image types are detected
 
