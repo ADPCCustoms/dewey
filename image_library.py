@@ -1,7 +1,7 @@
 """Image Library - index, tag and search your images. Files are never moved or changed.
 Requires: pip install pillow
 """
-import hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading
+import hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
@@ -10,10 +10,16 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
+try:  # optional: enables dragging folders / images onto the window
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = TkinterDnD = None
+
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DB_PATH = BASE / "library.db"
 THUMB, PAGE = 140, 60
+WATCH_MS = 60_000  # how often watched folders are checked
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS images(
@@ -21,6 +27,8 @@ CREATE TABLE IF NOT EXISTS images(
   taken TEXT, kind TEXT, prompt TEXT);
 CREATE TABLE IF NOT EXISTS tags(
   image_id INTEGER, tag TEXT, UNIQUE(image_id, tag));
+CREATE TABLE IF NOT EXISTS watch(folder TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -96,18 +104,28 @@ def file_hash(p):
     return h.hexdigest()
 
 
-def index_worker(folder, db_path, q, cancel):
-    """Runs in a background thread with its own database connection."""
+def index_worker(sources, db_path, q, cancel, settle=0):
+    """Runs in a background thread with its own database connection.
+    sources: folders and/or image files. settle: skip files modified in the last N seconds
+    (they may still be downloading); they are picked up on the next scan."""
     try:
         db = sqlite3.connect(db_path, timeout=30)
         known = {r[0] for r in db.execute("SELECT path FROM images")}
         files = []
-        for dirpath, _, names in os.walk(folder):
+        for src in sources:
             if cancel.is_set():
                 break
-            for n in names:
-                if os.path.splitext(n)[1].lower() in EXTS:
-                    files.append(str(Path(dirpath) / n))
+            if os.path.isfile(src):
+                if os.path.splitext(src)[1].lower() in EXTS:
+                    files.append(str(Path(src)))
+                continue
+            for dirpath, _, names in os.walk(src):
+                if cancel.is_set():
+                    break
+                for n in names:
+                    if os.path.splitext(n)[1].lower() in EXTS:
+                        files.append(str(Path(dirpath) / n))
+        files = list(dict.fromkeys(files))
         q.put(("total", len(files)))
         added = skipped = failed = 0
         for n, f in enumerate(files, 1):
@@ -117,6 +135,8 @@ def index_worker(folder, db_path, q, cancel):
                 skipped += 1
             else:
                 try:
+                    if settle and time.time() - os.path.getmtime(f) < settle:
+                        continue
                     p = Path(f)
                     taken, kind, prompt = file_info(p)
                     db.execute("INSERT OR IGNORE INTO images(path,hash,taken,kind,prompt) "
@@ -239,6 +259,8 @@ class App:
         self.index_job, self.index_thread = None, None
         self.build_ui()
         self.refresh()
+        self.setup_dnd()
+        self.root.after(2000, self.watch_tick)
 
     # ---------- UI ----------
     def build_ui(self):
@@ -277,6 +299,7 @@ class App:
             side="left", padx=(12, 4))
         ttk.Button(top2, text="Delete duplicates…", command=self.delete_duplicates_dialog).pack(
             side="left")
+        ttk.Button(top2, text="Watch folders…", command=self.watch_dialog).pack(side="left", padx=4)
         self.prog = ttk.Frame(top2)  # shown only while a folder is being indexed
         self.prog_label = ttk.Label(self.prog, text="")
         self.prog_label.pack(side="left", padx=6)
@@ -693,20 +716,26 @@ class App:
                 "(rename it to library.db) to go back to the last good copy.")
 
     def add_folder(self):
-        if self.index_job:
-            messagebox.showinfo("Add folder", "A folder is already being added. "
-                                "Wait for it to finish or press Cancel.")
-            return
         folder = filedialog.askdirectory(title="Choose a folder of images to add")
-        if not folder:
+        if folder:
+            self.start_index([folder])
+
+    def start_index(self, sources, silent=False):
+        """Import folders and/or image files in the background (silent = no progress bar)."""
+        if self.index_job:
+            if not silent:
+                messagebox.showinfo("Add images", "An import is already running. "
+                                    "Wait for it to finish or press Cancel.")
             return
         q, cancel = queue.Queue(), threading.Event()
-        self.index_job = (q, cancel)
-        self.prog_bar.config(value=0, maximum=1)
-        self.prog_label.config(text="Scanning folder…")
-        self.prog.pack(side="right")
-        self.index_thread = threading.Thread(target=index_worker,
-                                             args=(folder, str(DB_PATH), q, cancel), daemon=True)
+        self.index_job = (q, cancel, silent)
+        if not silent:
+            self.prog_bar.config(value=0, maximum=1)
+            self.prog_label.config(text="Scanning…")
+            self.prog.pack(side="right")
+        self.index_thread = threading.Thread(
+            target=index_worker, args=(list(sources), str(DB_PATH), q, cancel, 5 if silent else 0),
+            daemon=True)
         self.index_thread.start()
         self.root.after(100, self.poll_index)
 
@@ -718,35 +747,132 @@ class App:
     def poll_index(self):
         if not self.index_job:
             return
-        q = self.index_job[0]
-        finished = False
+        q, _, silent = self.index_job
+        finished, added = False, 0
         try:
             while True:
                 msg = q.get_nowait()
-                if msg[0] == "total":
+                if msg[0] == "total" and not silent:
                     self.prog_bar.config(maximum=max(1, msg[1]))
                     self.prog_label.config(text=f"Found {msg[1]} images")
-                elif msg[0] == "progress":
+                elif msg[0] == "progress" and not silent:
                     self.prog_bar.config(value=msg[1])
                     self.prog_label.config(text=f"{msg[1]} checked, {msg[2]} new")
                 elif msg[0] == "done":
                     _, added, skipped, failed, cancelled = msg
-                    text = f"Added {added} new, {skipped} already in library"
-                    if failed:
-                        text += f", {failed} failed"
-                    self.status.config(text=text + (" (cancelled)" if cancelled else ""))
+                    if silent:
+                        if added:
+                            self.status.config(text=f"Watch: {added} new image(s) added")
+                    else:
+                        text = f"Added {added} new, {skipped} already in library"
+                        if failed:
+                            text += f", {failed} failed"
+                        self.status.config(text=text + (" (cancelled)" if cancelled else ""))
                     finished = True
                 elif msg[0] == "error":
-                    messagebox.showerror("Indexing failed", msg[1])
+                    if silent:
+                        self.status.config(text="Watch check failed")
+                    else:
+                        messagebox.showerror("Indexing failed", msg[1])
                     finished = True
         except queue.Empty:
             pass
-        if finished:
-            self.index_job = None
-            self.prog.pack_forget()
-            self.reset_page()
-        else:
+        if not finished:
             self.root.after(150, self.poll_index)
+            return
+        self.index_job = None
+        self.prog.pack_forget()
+        if not silent:
+            self.reset_page()
+        elif added:
+            if self.page == 0 and not self.selected:
+                self.refresh()  # nothing to lose, so show the new images straight away
+            else:
+                self.refresh_sidebar()
+
+    # ---------- drag and drop (optional) ----------
+    def setup_dnd(self):
+        if not DND_FILES:
+            return
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self.on_drop)
+            self.status.config(text="Tip: drop folders or images onto this window to add them")
+        except Exception:
+            pass
+
+    def on_drop(self, event):
+        self.start_index(list(self.root.tk.splitlist(event.data)))
+
+    # ---------- watch folders ----------
+    def watch_folders(self):
+        return [r[0] for r in self.db.execute("SELECT folder FROM watch ORDER BY folder")]
+
+    def watch_enabled(self):
+        r = self.db.execute("SELECT value FROM settings WHERE key='watch_enabled'").fetchone()
+        return r is None or r[0] == "1"
+
+    def watch_tick(self):
+        try:
+            if self.watch_enabled():
+                folders = self.watch_folders()
+                if folders:
+                    self.start_index(folders, silent=True)
+        finally:
+            self.root.after(WATCH_MS, self.watch_tick)
+
+    def watch_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Watch folders")
+        win.geometry("580x400")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, justify="left", text=(
+            "New images in these folders are added to the library automatically.\n"
+            "They are checked once at startup, then every minute while the app is open.")
+        ).pack(anchor="w", padx=12, pady=10)
+        lb = tk.Listbox(win, activestyle="none")
+        lb.pack(fill="both", expand=True, padx=12)
+
+        def reload():
+            lb.delete(0, "end")
+            for f in self.watch_folders():
+                lb.insert("end", f)
+
+        def add():
+            f = filedialog.askdirectory(parent=win, title="Folder to watch")
+            if f:
+                self.db.execute("INSERT OR IGNORE INTO watch VALUES(?)", (str(Path(f)),))
+                self.db.commit()
+                reload()
+                self.start_index([str(Path(f))])  # import what is already in it
+
+        def remove():
+            for i in lb.curselection():
+                self.db.execute("DELETE FROM watch WHERE folder=?", (lb.get(i),))
+            self.db.commit()
+            reload()
+
+        def toggle():
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('watch_enabled', ?)",
+                            ("1" if enabled.get() else "0",))
+            self.db.commit()
+
+        def check_now():
+            folders = self.watch_folders()
+            if folders:
+                self.start_index(folders)
+
+        enabled = tk.BooleanVar(value=self.watch_enabled())
+        ttk.Checkbutton(win, text="Check these folders automatically", variable=enabled,
+                        command=toggle).pack(anchor="w", padx=12, pady=6)
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Button(btns, text="Add folder…", command=add).pack(side="left")
+        ttk.Button(btns, text="Remove selected", command=remove).pack(side="left", padx=4)
+        ttk.Button(btns, text="Check now", command=check_now).pack(side="left")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        reload()
 
     def on_close(self):
         if self.index_job:
@@ -1250,7 +1376,10 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    try:
+        root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
+    except Exception:  # drag-and-drop library present but not usable
+        root = tk.Tk()
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

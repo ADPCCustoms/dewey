@@ -1,9 +1,8 @@
-## What's new in v1.4
+## What's new in v1.5
 
-- Adding a folder now runs in the background with a progress bar and a Cancel button, so the window stays responsive
-- Re-adding a folder is much faster: files already in the library are skipped without being read
-- Thumbnails are cached on disk and load in the background, so pages appear straight away after the first view
-- Automatic backup: library.db is checked on launch and copied to library.db.bak when healthy, with a warning if it looks damaged
-- More robust thumbnail handling on very large libraries
+- Watch folders: pick folders (for example where your downloads land) and new images are added to the library automatically, once at startup and then every minute while the app is open. Manage them with the new Watch folders button
+- Drag and drop: drop folders or individual images onto the window to add them
+- Files that are still being downloaded are left until they have finished, so half-written images are not indexed
+- You can now add individual image files, not just whole folders
 
-Existing libraries work as they are. A `thumbs` folder appears next to the app and can be deleted at any time.
+Existing libraries upgrade automatically on first launch.

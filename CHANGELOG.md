@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5
+- Watch folders: new images in chosen folders are added automatically (at startup, then every minute)
+- Drag and drop folders or image files onto the window
+- Files still being written are skipped until they settle
+- Individual image files can be added, not just folders
+
 ## v1.4
 - Folder import runs in the background with progress bar and Cancel
 - Re-adding a folder skips files already in the library without reading them

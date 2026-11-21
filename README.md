@@ -7,6 +7,8 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 ## Features
 
 - **Add folder**: index a folder and all its subfolders in the background, with a progress bar and Cancel button. Re-adding a folder only picks up new images and skips known files without reading them.
+- **Watch folders**: choose folders to monitor. New images are added automatically at startup and then every minute while the app is open. Files still being downloaded are skipped until they finish.
+- **Drag and drop**: drop folders or image files onto the window to add them (needs the optional `tkinterdnd2` package, see below).
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
 - **Search** by filename, prompt text or tag. Several words must all match.
 - **Filter by type**: photo, ai or other.
@@ -39,6 +41,14 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 ```
 pip install -r requirements.txt
 ```
+
+Optional, for drag and drop:
+
+```
+pip install tkinterdnd2
+```
+
+The app works without it; you just use the **Add folder** button instead.
 
 ## Run
 
