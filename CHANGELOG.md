@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4
+- Folder import runs in the background with progress bar and Cancel
+- Re-adding a folder skips files already in the library without reading them
+- Thumbnails cached on disk and loaded in the background
+- Automatic library.db health check and backup (library.db.bak) on launch
+- More robust thumbnail handling on very large libraries
+
 ## v1.3
 - Full-size viewer with arrow-key browsing, quick rating and favourite
 - Sort options: newest, oldest, name A-Z / Z-A, highest rated, favourites first

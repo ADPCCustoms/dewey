@@ -6,7 +6,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 
 ## Features
 
-- **Add folder**: index a folder and all its subfolders. Re-adding a folder only picks up new images.
+- **Add folder**: index a folder and all its subfolders in the background, with a progress bar and Cancel button. Re-adding a folder only picks up new images and skips known files without reading them.
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
 - **Search** by filename, prompt text or tag. Several words must all match.
 - **Filter by type**: photo, ai or other.
@@ -46,7 +46,7 @@ pip install -r requirements.txt
 python image_library.py
 ```
 
-The library is saved as `library.db` next to the script (or next to the exe).
+The library is saved as `library.db` next to the script (or next to the exe). On each launch it is health-checked and, if healthy, copied to `library.db.bak`. Thumbnails are cached in a `thumbs` folder next to it, which is safe to delete.
 
 ## Build an .exe (Windows)
 

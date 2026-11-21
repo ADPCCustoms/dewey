@@ -1,9 +1,9 @@
-## What's new in v1.3
+## What's new in v1.4
 
-- Full-size viewer: double-click a thumbnail or press View. Left/Right browse your current search or filter, 0-5 rates, F toggles favourite, Esc closes
-- Sort by newest, oldest, name A-Z / Z-A, highest rated or favourites first
-- Delete duplicates: pick which copy to keep, preview the sets, then send the extras to the Recycle Bin. Tags, favourite and rating are merged into the kept copy
-- Clean up missing files: remove library entries whose files have been deleted or moved
-- Copy button for the embedded prompt
+- Adding a folder now runs in the background with a progress bar and a Cancel button, so the window stays responsive
+- Re-adding a folder is much faster: files already in the library are skipped without being read
+- Thumbnails are cached on disk and load in the background, so pages appear straight away after the first view
+- Automatic backup: library.db is checked on launch and copied to library.db.bak when healthy, with a warning if it looks damaged
+- More robust thumbnail handling on very large libraries
 
-Existing libraries upgrade automatically on first launch.
+Existing libraries work as they are. A `thumbs` folder appears next to the app and can be deleted at any time.

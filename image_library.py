@@ -1,7 +1,7 @@
 """Image Library - index, tag and search your images. Files are never moved or changed.
 Requires: pip install pillow
 """
-import hashlib, os, re, shutil, sqlite3, subprocess, sys
+import hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
@@ -48,6 +48,90 @@ def unique_path(target):
         if not cand.exists():
             return cand
         n += 1
+
+
+THUMB_DIR = BASE / "thumbs"
+
+
+def make_thumb(path):
+    """PIL thumbnail for a file, read from / saved to the on-disk cache when possible."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return Image.new("RGB", (THUMB, THUMB), "#888888")
+    key = hashlib.md5(f"{path}|{st.st_mtime_ns}|{st.st_size}|{THUMB}".encode()).hexdigest()
+    cache_file = THUMB_DIR / f"{key}.jpg"
+    try:
+        if cache_file.exists():
+            return Image.open(cache_file).convert("RGB")
+    except Exception:
+        pass
+    try:
+        img = Image.open(path)
+        img.draft("RGB", (THUMB * 2, THUMB * 2))  # much faster decoding for big JPEGs
+        img = img.convert("RGB")
+        img.thumbnail((THUMB, THUMB))
+    except Exception:
+        return Image.new("RGB", (THUMB, THUMB), "#888888")
+    try:
+        THUMB_DIR.mkdir(exist_ok=True)
+        img.save(cache_file, "JPEG", quality=85)
+    except Exception:
+        pass
+    return img
+
+
+def thumb_worker(items, token, state, q):
+    for iid, path in items:
+        if state["token"] != token:  # a newer page was drawn, stop wasting effort
+            return
+        q.put((token, iid, path, make_thumb(path)))
+
+
+def file_hash(p):
+    h = hashlib.sha1()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def index_worker(folder, db_path, q, cancel):
+    """Runs in a background thread with its own database connection."""
+    try:
+        db = sqlite3.connect(db_path, timeout=30)
+        known = {r[0] for r in db.execute("SELECT path FROM images")}
+        files = []
+        for dirpath, _, names in os.walk(folder):
+            if cancel.is_set():
+                break
+            for n in names:
+                if os.path.splitext(n)[1].lower() in EXTS:
+                    files.append(str(Path(dirpath) / n))
+        q.put(("total", len(files)))
+        added = skipped = failed = 0
+        for n, f in enumerate(files, 1):
+            if cancel.is_set():
+                break
+            if f in known:
+                skipped += 1
+            else:
+                try:
+                    p = Path(f)
+                    taken, kind, prompt = file_info(p)
+                    db.execute("INSERT OR IGNORE INTO images(path,hash,taken,kind,prompt) "
+                               "VALUES(?,?,?,?,?)", (f, file_hash(p), taken, kind, prompt))
+                    added += 1
+                except Exception:
+                    failed += 1
+            if n % 25 == 0:
+                db.commit()
+                q.put(("progress", n, added))
+        db.commit()
+        db.close()
+        q.put(("done", added, skipped, failed, cancel.is_set()))
+    except Exception as e:
+        q.put(("error", str(e)))
 
 
 _P = "replace(path, '/', '\\')"
@@ -135,13 +219,14 @@ class App:
         self.root = root
         root.title("Image Library")
         root.geometry("1280x740")
-        self.db = sqlite3.connect(DB_PATH)
+        self.db = sqlite3.connect(DB_PATH, timeout=30)
         self.db.executescript(SCHEMA)
         for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0"):
             try:
                 self.db.execute(f"ALTER TABLE images ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        self.backup_library()
         self.page, self.rows, self.total = 0, [], 0
         self.cache, self.cols = {}, 5
         self.normal_bg = root.cget("bg")
@@ -149,6 +234,9 @@ class App:
         self.sel_path, self.widgets = None, {}
         self.side_filter, self.side_items = ("all", None), []
         self.debounce = None
+        self.placeholder = None
+        self.thumb_state, self.thumb_q, self.thumb_left = {"token": 0}, queue.Queue(), set()
+        self.index_job, self.index_thread = None, None
         self.build_ui()
         self.refresh()
 
@@ -189,6 +277,12 @@ class App:
             side="left", padx=(12, 4))
         ttk.Button(top2, text="Delete duplicates…", command=self.delete_duplicates_dialog).pack(
             side="left")
+        self.prog = ttk.Frame(top2)  # shown only while a folder is being indexed
+        self.prog_label = ttk.Label(self.prog, text="")
+        self.prog_label.pack(side="left", padx=6)
+        self.prog_bar = ttk.Progressbar(self.prog, length=220, mode="determinate")
+        self.prog_bar.pack(side="left")
+        ttk.Button(self.prog, text="Cancel", command=self.cancel_index).pack(side="left", padx=6)
 
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=8)
@@ -330,32 +424,65 @@ class App:
         self.update_selection()
         self.refresh_sidebar()
 
-    def thumb(self, path):
+    def thumb_image(self, path):
+        """Cached PhotoImage, or a grey placeholder until the background loader fills it in."""
         if path in self.cache:
             return self.cache[path]
+        if self.placeholder is None:
+            self.placeholder = ImageTk.PhotoImage(Image.new("RGB", (THUMB, THUMB), "#cccccc"))
+        return self.placeholder
+
+    def start_thumbs(self):
+        self.thumb_state["token"] += 1
+        token = self.thumb_state["token"]
+        todo = [(i, p) for i, p, _ in self.rows if p not in self.cache]
+        self.thumb_left = {i for i, _ in todo}
+        if not todo:
+            return
+        threading.Thread(target=thumb_worker, args=(todo, token, self.thumb_state, self.thumb_q),
+                         daemon=True).start()
+        self.root.after(30, lambda: self.poll_thumbs(token))
+
+    def poll_thumbs(self, token):
+        if token != self.thumb_state["token"]:
+            return  # a newer page has been drawn
+        got = 0
         try:
-            img = Image.open(path).convert("RGB")
-            img.thumbnail((THUMB, THUMB))
-        except Exception:
-            img = Image.new("RGB", (THUMB, THUMB), "#888888")
-        if len(self.cache) > 600:
-            self.cache.clear()
-        self.cache[path] = ImageTk.PhotoImage(img)
-        return self.cache[path]
+            while got < 12:  # a few at a time keeps the window responsive
+                t, iid, path, img = self.thumb_q.get_nowait()
+                if t != token:
+                    continue
+                self.thumb_left.discard(iid)
+                w = self.widgets.get(iid)
+                if w is None:
+                    continue
+                ph = ImageTk.PhotoImage(img)
+                while len(self.cache) > 600:
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[path] = ph
+                w.config(image=ph)
+                w.image = ph  # the label must keep its own reference
+                got += 1
+        except queue.Empty:
+            pass
+        if self.thumb_left:
+            self.root.after(40, lambda: self.poll_thumbs(token))
 
     def render(self):
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self.widgets = {}
         for n, (iid, path, fav) in enumerate(self.rows):
-            lbl = tk.Label(self.grid_frame, image=self.thumb(path), bd=0, padx=3, pady=3,
-                           cursor="hand2")
+            ph = self.thumb_image(path)
+            lbl = tk.Label(self.grid_frame, image=ph, bd=0, padx=3, pady=3, cursor="hand2")
+            lbl.image = ph
             lbl.grid(row=n // self.cols, column=n % self.cols, padx=3, pady=3)
             lbl.bind("<Button-1>", lambda e, i=iid: self.on_click(e, i))
             lbl.bind("<Double-Button-1>", lambda e, i=iid: self.open_viewer(i))
             self.widgets[iid] = lbl
         self.recolor()
         self.canvas.yview_moveto(0)
+        self.start_thumbs()
 
     def recolor(self):
         for iid, _, fav in self.rows:
@@ -547,30 +674,86 @@ class App:
             else:
                 subprocess.run(["xdg-open", str(Path(self.sel_path).parent)])
 
-    # ---------- indexing ----------
+    # ---------- indexing (background) ----------
+    def backup_library(self):
+        """Keep library.db.bak as the last known-good copy, taken at launch."""
+        try:
+            ok = self.db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        except sqlite3.DatabaseError:
+            ok = False
+        if ok:
+            try:
+                shutil.copy2(DB_PATH, DB_PATH.with_name(DB_PATH.name + ".bak"))
+            except OSError:
+                pass
+        else:
+            messagebox.showwarning(
+                "Library problem",
+                "library.db looks damaged. Close the app and restore library.db.bak "
+                "(rename it to library.db) to go back to the last good copy.")
+
     def add_folder(self):
+        if self.index_job:
+            messagebox.showinfo("Add folder", "A folder is already being added. "
+                                "Wait for it to finish or press Cancel.")
+            return
         folder = filedialog.askdirectory(title="Choose a folder of images to add")
         if not folder:
             return
-        added = 0
-        for n, p in enumerate(Path(folder).rglob("*")):
-            if p.suffix.lower() not in EXTS:
-                continue
-            try:
-                h = hashlib.sha1(p.read_bytes()).hexdigest()
-                taken, kind, prompt = file_info(p)
-                cur = self.db.execute(
-                    "INSERT OR IGNORE INTO images(path,hash,taken,kind,prompt) VALUES(?,?,?,?,?)",
-                    (str(p), h, taken, kind, prompt))
-                added += cur.rowcount
-            except OSError:
-                continue
-            if n % 20 == 0:
-                self.status.config(text=f"Indexing… {added} added")
-                self.root.update_idletasks()
-        self.db.commit()
-        self.status.config(text=f"Added {added} new images")
-        self.reset_page()
+        q, cancel = queue.Queue(), threading.Event()
+        self.index_job = (q, cancel)
+        self.prog_bar.config(value=0, maximum=1)
+        self.prog_label.config(text="Scanning folder…")
+        self.prog.pack(side="right")
+        self.index_thread = threading.Thread(target=index_worker,
+                                             args=(folder, str(DB_PATH), q, cancel), daemon=True)
+        self.index_thread.start()
+        self.root.after(100, self.poll_index)
+
+    def cancel_index(self):
+        if self.index_job:
+            self.index_job[1].set()
+            self.prog_label.config(text="Cancelling…")
+
+    def poll_index(self):
+        if not self.index_job:
+            return
+        q = self.index_job[0]
+        finished = False
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "total":
+                    self.prog_bar.config(maximum=max(1, msg[1]))
+                    self.prog_label.config(text=f"Found {msg[1]} images")
+                elif msg[0] == "progress":
+                    self.prog_bar.config(value=msg[1])
+                    self.prog_label.config(text=f"{msg[1]} checked, {msg[2]} new")
+                elif msg[0] == "done":
+                    _, added, skipped, failed, cancelled = msg
+                    text = f"Added {added} new, {skipped} already in library"
+                    if failed:
+                        text += f", {failed} failed"
+                    self.status.config(text=text + (" (cancelled)" if cancelled else ""))
+                    finished = True
+                elif msg[0] == "error":
+                    messagebox.showerror("Indexing failed", msg[1])
+                    finished = True
+        except queue.Empty:
+            pass
+        if finished:
+            self.index_job = None
+            self.prog.pack_forget()
+            self.reset_page()
+        else:
+            self.root.after(150, self.poll_index)
+
+    def on_close(self):
+        if self.index_job:
+            self.index_job[1].set()
+            if self.index_thread:
+                self.index_thread.join(timeout=3)
+        self.root.destroy()
 
     # ---------- manual type override ----------
     def mark_showing(self):
@@ -1068,5 +1251,6 @@ class App:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

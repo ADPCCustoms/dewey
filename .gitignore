@@ -1,5 +1,9 @@
 # Your personal library (image paths, tags, prompts) - never commit this
 library.db
+library.db.bak
+
+# Thumbnail cache (rebuilt automatically)
+thumbs/
 
 # Build output
 build/
