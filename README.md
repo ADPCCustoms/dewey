@@ -10,6 +10,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Watch folders**: choose folders to monitor. New images are added automatically at startup and then every minute while the app is open. Files still being downloaded are skipped until they finish.
 - **Drag and drop**: drop folders or image files onto the window to add them (needs the optional `tkinterdnd2` package, see below).
 - **Dark mode**: toggle in the top bar; your choice is remembered.
+- **Thumbnail size**: slider in the bottom bar (80 to 280 px) or Ctrl + mouse wheel over the grid; remembered between sessions.
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
 - **Search** by filename, prompt text or tag. Several words must all match.
 - **Filter by type**: photo, ai or other.

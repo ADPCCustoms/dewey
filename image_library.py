@@ -19,6 +19,7 @@ EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DB_PATH = BASE / "library.db"
 THUMB, PAGE = 140, 60
+SIZES = [80, 110, 140, 180, 220, 280]  # thumbnail sizes offered by the slider
 WATCH_MS = 60_000  # how often watched folders are checked
 
 SCHEMA = """
@@ -61,13 +62,13 @@ def unique_path(target):
 THUMB_DIR = BASE / "thumbs"
 
 
-def make_thumb(path, placeholder=True):
+def make_thumb(path, placeholder=True, size=THUMB):
     """PIL thumbnail for a file, read from / saved to the on-disk cache when possible."""
     try:
         st = os.stat(path)
     except OSError:
-        return Image.new("RGB", (THUMB, THUMB), "#888888") if placeholder else None
-    key = hashlib.md5(f"{path}|{st.st_mtime_ns}|{st.st_size}|{THUMB}".encode()).hexdigest()
+        return Image.new("RGB", (size, size), "#888888") if placeholder else None
+    key = hashlib.md5(f"{path}|{st.st_mtime_ns}|{st.st_size}|{size}".encode()).hexdigest()
     cache_file = THUMB_DIR / f"{key}.jpg"
     try:
         if cache_file.exists():
@@ -76,11 +77,11 @@ def make_thumb(path, placeholder=True):
         pass
     try:
         img = Image.open(path)
-        img.draft("RGB", (THUMB * 2, THUMB * 2))  # much faster decoding for big JPEGs
+        img.draft("RGB", (size * 2, size * 2))  # much faster decoding for big JPEGs
         img = img.convert("RGB")
-        img.thumbnail((THUMB, THUMB))
+        img.thumbnail((size, size))
     except Exception:
-        return Image.new("RGB", (THUMB, THUMB), "#888888") if placeholder else None
+        return Image.new("RGB", (size, size), "#888888") if placeholder else None
     try:
         THUMB_DIR.mkdir(exist_ok=True)
         img.save(cache_file, "JPEG", quality=85)
@@ -89,11 +90,11 @@ def make_thumb(path, placeholder=True):
     return img
 
 
-def thumb_worker(items, token, state, q):
+def thumb_worker(items, token, state, q, size=THUMB):
     for iid, path in items:
         if state["token"] != token:  # a newer page was drawn, stop wasting effort
             return
-        q.put((token, iid, path, make_thumb(path)))
+        q.put((token, iid, path, make_thumb(path, size=size)))
 
 
 popcount = int.bit_count if hasattr(int, "bit_count") else (lambda x: bin(x).count("1"))
@@ -354,6 +355,8 @@ class App:
         self.default_theme = ttk.Style().theme_use()
         row = self.db.execute("SELECT value FROM settings WHERE key='theme'").fetchone()
         self.theme = row[0] if row and row[0] in THEMES else "light"
+        row = self.db.execute("SELECT value FROM settings WHERE key='thumb_size'").fetchone()
+        self.thumb_size = int(row[0]) if row and row[0].isdigit() and int(row[0]) in SIZES else THUMB
         self.apply_theme(self.theme, walk=False)
         self.build_ui()
         self.refresh()
@@ -490,9 +493,18 @@ class App:
         ttk.Button(pager, text="Clear selection", command=self.clear_selection).pack(side="left", padx=4)
         ttk.Button(pager, text="Rename…", command=self.rename_dialog).pack(side="left")
         ttk.Label(pager, text="Ctrl-click / Shift-click to select several").pack(side="right", padx=8)
+        self.size_label = ttk.Label(pager, text=f"{self.thumb_size}px", width=6)
+        self.size_label.pack(side="right")
+        self.size_scale = ttk.Scale(pager, from_=0, to=len(SIZES) - 1, length=140,
+                                    command=self.on_size_drag)
+        self.size_scale.set(SIZES.index(self.thumb_size))
+        self.size_scale.pack(side="right")
+        self.size_scale.bind("<ButtonRelease-1>", self.on_size_release)
+        ttk.Label(pager, text="Thumbnail size").pack(side="right", padx=6)
+        self.canvas.bind_all("<Control-MouseWheel>", self.on_zoom_wheel)
 
     def on_resize(self, event):
-        cols = max(1, event.width // (THUMB + 16))
+        cols = max(1, event.width // (self.thumb_size + 16))
         if cols != self.cols:
             self.cols = cols
             self.render()
@@ -554,8 +566,37 @@ class App:
         if path in self.cache:
             return self.cache[path]
         if self.placeholder is None:
-            self.placeholder = ImageTk.PhotoImage(Image.new("RGB", (THUMB, THUMB), "#cccccc"))
+            self.placeholder = ImageTk.PhotoImage(Image.new("RGB", (self.thumb_size, self.thumb_size), "#cccccc"))
         return self.placeholder
+
+    def on_size_drag(self, value):
+        n = min(max(int(round(float(value))), 0), len(SIZES) - 1)
+        self.size_label.config(text=f"{SIZES[n]}px")
+
+    def on_size_release(self, event=None):
+        n = min(max(int(round(float(self.size_scale.get()))), 0), len(SIZES) - 1)
+        self.size_scale.set(n)  # snap the handle to the nearest step
+        self.set_thumb_size(SIZES[n])
+
+    def on_zoom_wheel(self, event):
+        if str(event.widget).startswith(str(self.canvas)):  # only while over the thumbnail grid
+            self.step_size(1 if event.delta > 0 else -1)
+
+    def step_size(self, delta):
+        n = min(max(SIZES.index(self.thumb_size) + delta, 0), len(SIZES) - 1)
+        self.size_scale.set(n)
+        self.set_thumb_size(SIZES[n])
+
+    def set_thumb_size(self, size):
+        if size == self.thumb_size:
+            return
+        self.thumb_size = size
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES('thumb_size', ?)", (str(size),))
+        self.db.commit()
+        self.cache.clear()
+        self.placeholder = None
+        self.cols = max(1, self.canvas.winfo_width() // (size + 16))
+        self.render()
 
     def start_thumbs(self):
         self.thumb_state["token"] += 1
@@ -564,7 +605,7 @@ class App:
         self.thumb_left = {i for i, _ in todo}
         if not todo:
             return
-        threading.Thread(target=thumb_worker, args=(todo, token, self.thumb_state, self.thumb_q),
+        threading.Thread(target=thumb_worker, args=(todo, token, self.thumb_state, self.thumb_q, self.thumb_size),
                          daemon=True).start()
         self.root.after(30, lambda: self.poll_thumbs(token))
 

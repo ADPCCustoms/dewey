@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.8
+- Thumbnail size slider (80 to 280 px) and Ctrl + mouse wheel zoom, remembered between sessions
+- Separate thumbnail cache per size
+
 ## v1.7
 - Dark mode toggle, remembered between sessions
 - Theme applies to the sidebar, dialogs, lists, text boxes and dropdowns

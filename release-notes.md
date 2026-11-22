@@ -1,7 +1,8 @@
-## What's new in v1.7
+## What's new in v1.8
 
-- Dark mode: a new toggle button in the top bar switches between the normal look and a dark theme, and your choice is remembered next time you open the app
-- The whole window follows the theme, including the sidebar, dialogs, lists, text boxes and dropdowns. The full-size viewer stays black either way
-- On Windows 10 and 11 the title bar goes dark too
+- Thumbnail size slider in the bottom bar: six steps from 80 to 280 pixels, for scanning a big library quickly or inspecting detail
+- Ctrl + mouse wheel over the grid zooms in and out
+- Your chosen size is remembered between sessions
+- Each size keeps its own cached thumbnails, so switching back to a size you have used is instant
 
-Existing libraries work as they are.
+Existing libraries work as they are. The similar-image finder is unaffected by the display size.
