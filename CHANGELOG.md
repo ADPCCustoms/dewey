@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.7
+- Dark mode toggle, remembered between sessions
+- Theme applies to the sidebar, dialogs, lists, text boxes and dropdowns
+- Dark title bar on Windows 10 and 11
+
 ## v1.6
 - Find similar: groups look-alike images (resized, re-saved, brightness changes) with a strictness slider
 - Side-by-side review per group; keep the largest by default, others to the Recycle Bin with tags merged

@@ -279,6 +279,13 @@ def to_recycle_bin(path):
         send2trash(str(path))
 
 
+THEMES = {
+    "light": dict(bg="#f0f0f0", fg="#000000", field="#ffffff", sel="#3b82f6", selfg="#ffffff",
+                  btn="#e1e1e1", btn_active="#d0d0d0", border="#adadad", dim="#6d6d6d"),
+    "dark": dict(bg="#1e1f22", fg="#e6e6e6", field="#2b2d31", sel="#3b82f6", selfg="#ffffff",
+                 btn="#3a3d42", btn_active="#4a4d54", border="#3a3d42", dim="#8a8f98"),
+}
+
 COL_SEL, COL_FAV = "#3b82f6", "#f5c518"
 
 
@@ -344,8 +351,13 @@ class App:
         self.placeholder = None
         self.thumb_state, self.thumb_q, self.thumb_left = {"token": 0}, queue.Queue(), set()
         self.index_job, self.index_thread = None, None
+        self.default_theme = ttk.Style().theme_use()
+        row = self.db.execute("SELECT value FROM settings WHERE key='theme'").fetchone()
+        self.theme = row[0] if row and row[0] in THEMES else "light"
+        self.apply_theme(self.theme, walk=False)
         self.build_ui()
         self.refresh()
+        self.apply_theme(self.theme)
         self.setup_dnd()
         self.root.after(2000, self.watch_tick)
 
@@ -373,6 +385,8 @@ class App:
         ttk.Button(top, text="Apply", command=self.mark_showing).pack(side="left")
         self.status = ttk.Label(top, text="")
         self.status.pack(side="right")
+        self.theme_btn = ttk.Button(top, text="Dark mode", command=self.toggle_theme)
+        self.theme_btn.pack(side="right", padx=8)
 
         top2 = ttk.Frame(self.root)
         top2.pack(fill="x", padx=8)
@@ -878,6 +892,116 @@ class App:
             else:
                 self.refresh_sidebar()
 
+    # ---------- light / dark theme ----------
+    def toggle_theme(self):
+        mode = "dark" if self.theme == "light" else "light"
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES('theme', ?)", (mode,))
+        self.db.commit()
+        self.apply_theme(mode)
+
+    def apply_theme(self, mode, walk=True):
+        pal = THEMES[mode]
+        self.theme = mode
+        style = ttk.Style()
+        if mode == "dark":
+            style.theme_use("clam")
+
+            def cfg(name, **kw):
+                try:
+                    style.configure(name, **kw)
+                except tk.TclError:
+                    pass
+
+            def mp(name, **kw):
+                try:
+                    style.map(name, **kw)
+                except tk.TclError:
+                    pass
+
+            cfg(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"],
+                bordercolor=pal["border"], lightcolor=pal["border"], darkcolor=pal["border"],
+                troughcolor=pal["field"], insertcolor=pal["fg"], focuscolor=pal["bg"])
+            cfg("TButton", background=pal["btn"], foreground=pal["fg"], padding=(8, 3))
+            mp("TButton", background=[("active", pal["btn_active"]), ("disabled", pal["bg"])],
+               foreground=[("disabled", pal["dim"])])
+            cfg("TEntry", fieldbackground=pal["field"], foreground=pal["fg"], insertcolor=pal["fg"])
+            cfg("TCombobox", fieldbackground=pal["field"], background=pal["btn"],
+                foreground=pal["fg"], arrowcolor=pal["fg"], selectbackground=pal["field"],
+                selectforeground=pal["fg"])
+            mp("TCombobox", fieldbackground=[("readonly", pal["field"])],
+               foreground=[("readonly", pal["fg"])], background=[("readonly", pal["btn"])])
+            for name in ("TCheckbutton", "TRadiobutton"):
+                cfg(name, background=pal["bg"], foreground=pal["fg"],
+                    indicatorbackground=pal["field"], indicatorforeground=pal["fg"])
+                mp(name, background=[("active", pal["bg"])],
+                   indicatorbackground=[("selected", pal["sel"])])
+            cfg("TScrollbar", background=pal["btn"], troughcolor=pal["bg"], arrowcolor=pal["fg"],
+                bordercolor=pal["bg"])
+            mp("TScrollbar", background=[("active", pal["btn_active"])])
+            cfg("Horizontal.TProgressbar", background=pal["sel"], troughcolor=pal["field"])
+            cfg("TLabel", background=pal["bg"], foreground=pal["fg"])
+        else:
+            style.theme_use(self.default_theme)  # back to the native Windows look
+
+        r = self.root
+        r.configure(bg=pal["bg"])
+        for pat, val in (
+                ("*Listbox.background", pal["field"]), ("*Listbox.foreground", pal["fg"]),
+                ("*Listbox.selectBackground", pal["sel"]), ("*Listbox.selectForeground", pal["selfg"]),
+                ("*Text.background", pal["field"]), ("*Text.foreground", pal["fg"]),
+                ("*Text.insertBackground", pal["fg"]), ("*Text.selectBackground", pal["sel"]),
+                ("*Text.selectForeground", pal["selfg"]),
+                ("*Canvas.background", pal["bg"]), ("*Toplevel.background", pal["bg"]),
+                ("*Label.background", pal["bg"]), ("*Label.foreground", pal["fg"]),
+                ("*Scale.background", pal["bg"]), ("*Scale.foreground", pal["fg"]),
+                ("*Scale.troughColor", pal["field"]),
+                ("*TCombobox*Listbox.background", pal["field"]),
+                ("*TCombobox*Listbox.foreground", pal["fg"]),
+                ("*TCombobox*Listbox.selectBackground", pal["sel"]),
+                ("*TCombobox*Listbox.selectForeground", pal["selfg"])):
+            r.option_add(pat, val)
+        self.normal_bg = pal["bg"]
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.config(text="☀ Light mode" if mode == "dark" else "☾ Dark mode")
+        if walk:
+            self.recolor_tree(r, pal)
+            self.recolor()  # thumbnail borders use normal_bg
+            self.set_titlebar(mode == "dark")
+
+    def recolor_tree(self, w, pal):
+        """Recolour tk (non-ttk) widgets that are already on screen."""
+        if getattr(w, "no_theme", False):
+            return
+        cls = w.winfo_class()
+        try:
+            if cls in ("Tk", "Toplevel", "Frame", "Canvas"):
+                w.configure(bg=pal["bg"])
+            elif cls in ("Listbox", "Text"):
+                w.configure(bg=pal["field"], fg=pal["fg"], selectbackground=pal["sel"],
+                            selectforeground=pal["selfg"])
+                if cls == "Text":
+                    w.configure(insertbackground=pal["fg"])
+            elif cls == "Scale":
+                w.configure(bg=pal["bg"], fg=pal["fg"], troughcolor=pal["field"])
+        except tk.TclError:
+            pass
+        for child in w.winfo_children():
+            self.recolor_tree(child, pal)
+
+    def set_titlebar(self, dark):
+        """Dark title bar on Windows 10/11 (may need a click on the window to repaint)."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            val = ctypes.c_int(1 if dark else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val),
+                                                       ctypes.sizeof(val))
+        except Exception:
+            pass
+
     # ---------- similar images ----------
     def describe(self, iid):
         path = self.db.execute("SELECT path FROM images WHERE id=?", (iid,)).fetchone()[0]
@@ -1225,6 +1349,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.geometry("1000x760")
         win.configure(bg="black")
+        win.no_theme = True
         tk.Label(win, text="← → browse    0-5 rate    F favourite    Esc close",
                  bg="black", fg="#888888").pack(side="bottom")
         lbl = tk.Label(win, bg="black", fg="white")
