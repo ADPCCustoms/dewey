@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.10
+- Delete restore points by hand (multi-select), with an option to free the trash space they use
+- File moves of a deleted point are merged into the nearest older point, so older restore points keep working
+
 ## v1.9
 - Restore points: library snapshots plus a log of file moves, with preview and restore (itself undoable)
 - Covers rename, move-sort, delete duplicates (both tools), clean up missing, mark type, bulk tag/rating/favourite

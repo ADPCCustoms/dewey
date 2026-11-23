@@ -268,6 +268,43 @@ class RestoreStore:
         self.db.execute("DELETE FROM points WHERE id=?", (pid,))
         self.db.commit()
 
+    def delete_points(self, ids, free_space=False):
+        """Delete restore points by hand. Each deleted point's file moves are merged into the nearest
+        older point, so the remaining points can still put those files back. Files waiting in the
+        app trash go to the Windows Recycle Bin when free_space is set, or when no older point
+        exists to bring them back. Returns (points deleted, files sent to the Recycle Bin)."""
+        deleted = freed = 0
+        for pid in sorted(set(ids)):
+            row = self.db.execute("SELECT snapshot FROM points WHERE id=?", (pid,)).fetchone()
+            if not row:
+                continue
+            prev = self.db.execute("SELECT id FROM points WHERE id<? ORDER BY id DESC LIMIT 1",
+                                   (pid,)).fetchone()
+            if free_space or prev is None:
+                for mid, new in self.db.execute("SELECT id, new_path FROM moves WHERE point_id=?",
+                                                (pid,)).fetchall():
+                    if self.in_trash(new) and os.path.exists(new):
+                        try:
+                            to_recycle_bin(new)
+                            self.db.execute("UPDATE moves SET op='recycled' WHERE id=?", (mid,))
+                            freed += 1
+                        except OSError:
+                            pass
+            if prev:
+                self.db.execute("UPDATE moves SET point_id=? WHERE point_id=?", (prev[0], pid))
+            else:
+                self.db.execute("DELETE FROM moves WHERE point_id=?", (pid,))
+            self.db.execute("DELETE FROM points WHERE id=?", (pid,))
+            if row[0]:
+                (self.base / row[0]).unlink(missing_ok=True)
+            try:
+                (self.trash / str(pid)).rmdir()
+            except OSError:
+                pass
+            deleted += 1
+        self.db.commit()
+        return deleted, freed
+
     def points(self):
         return self.db.execute(
             "SELECT id, created, label, kind FROM points ORDER BY id DESC").fetchall()
@@ -1217,11 +1254,12 @@ class App:
             "A restore point is a snapshot of your library taken just before a risky change. "
             "Restoring returns the library, and every file the app renamed, moved or deleted, to how "
             "they were just before that change, and undoes all later changes too. "
-            "Deleted files wait in the app trash until their restore point is pruned.")
+            "Deleted files wait in the app trash until their restore point is pruned or deleted. "
+            "Select several points with Ctrl or Shift to delete them by hand.")
         ).pack(anchor="w", padx=12, pady=10)
         body = ttk.Frame(win)
         body.pack(fill="both", expand=True, padx=12)
-        lb = tk.Listbox(body, width=52, exportselection=False, activestyle="none")
+        lb = tk.Listbox(body, width=52, exportselection=False, activestyle="none", selectmode="extended")
         lb.pack(side="left", fill="y")
         box = tk.Text(body, wrap="word", state="disabled")
         box.pack(side="left", fill="both", expand=True, padx=(8, 0))
@@ -1275,6 +1313,9 @@ class App:
             p = picked()
             if not p:
                 return
+            if len(lb.curselection()) != 1:
+                messagebox.showinfo("Restore", "Select a single restore point to restore to.", parent=win)
+                return
             if self.index_job:
                 messagebox.showinfo("Restore", "Wait for the running import to finish first.", parent=win)
                 return
@@ -1314,12 +1355,38 @@ class App:
             else:
                 subprocess.run(["xdg-open", str(self.restore.trash)])
 
+        free_var = tk.BooleanVar(value=False)
+
+        def delete_selected():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showinfo("Delete", "Select one or more restore points first.", parent=win)
+                return
+            ids = [pts[i][0] for i in sel]
+            msg = (f"Delete {len(ids)} restore point(s)?\n\nYou will no longer be able to restore to "
+                   "exactly those moments. Your other restore points keep working, and files these "
+                   "points moved can still be put back by restoring to an older point.")
+            if free_var.get():
+                msg += ("\n\nFiles these points deleted will be sent to the Windows Recycle Bin to free "
+                        "space. Older restore points will no longer be able to bring those files back.")
+            if not messagebox.askyesno("Delete restore points", msg, parent=win):
+                return
+            n, freed = self.restore.delete_points(ids, free_var.get())
+            reload()
+            show(f"Deleted {n} restore point(s)."
+                 + (f" Sent {freed} files to the Windows Recycle Bin." if freed else ""))
+
+        ttk.Checkbutton(win, variable=free_var,
+                        text="When deleting, also free the trash space those points use "
+                             "(sends their deleted files to the Windows Recycle Bin)"
+                        ).pack(anchor="w", padx=12)
         btns = ttk.Frame(win)
         btns.pack(fill="x", padx=12, pady=10)
         ttk.Button(btns, text="Restore to this point…", command=restore_now).pack(side="left")
         ttk.Button(btns, text="Create restore point…", command=make_point).pack(side="left", padx=6)
-        ttk.Button(btns, text="Open trash folder", command=open_trash).pack(side="left")
-        ttk.Button(btns, text="Empty trash…", command=empty_trash).pack(side="left", padx=6)
+        ttk.Button(btns, text="Delete selected…", command=delete_selected).pack(side="left")
+        ttk.Button(btns, text="Open trash folder", command=open_trash).pack(side="left", padx=6)
+        ttk.Button(btns, text="Empty trash…", command=empty_trash).pack(side="left")
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
         lb.bind("<<ListboxSelect>>", preview)
         reload()
