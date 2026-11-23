@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.9
+- Restore points: library snapshots plus a log of file moves, with preview and restore (itself undoable)
+- Covers rename, move-sort, delete duplicates (both tools), clean up missing, mark type, bulk tag/rating/favourite
+- Deleted duplicates go to an app trash so they can be restored; pruned or emptied trash goes to the Windows Recycle Bin
+- Newest 20 restore points kept; settings are not rolled back
+
 ## v1.8
 - Thumbnail size slider (80 to 280 px) and Ctrl + mouse wheel zoom, remembered between sessions
 - Separate thumbnail cache per size

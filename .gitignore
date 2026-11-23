@@ -5,6 +5,9 @@ library.db.bak
 # Thumbnail cache (rebuilt automatically)
 thumbs/
 
+# Restore points and the app trash (your snapshots and deleted files)
+restore/
+
 # Build output
 build/
 dist/

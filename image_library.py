@@ -1,12 +1,12 @@
 """Image Library - index, tag and search your images. Files are never moved or changed.
 Requires: pip install pillow
 """
-import hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
+import gzip, hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
@@ -184,6 +184,232 @@ def similar_worker(db_path, threshold, q, cancel):
         q.put(("error", str(e)))
 
 
+RESTORE_DIR = BASE / "restore"
+MAX_POINTS = 20  # restore points kept; older ones are pruned
+BULK_MIN = 10    # bulk tag / rating / favourite changes on at least this many images make a point
+
+
+def ensure_schema(db):
+    db.executescript(SCHEMA)
+    for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0", "phash TEXT"):
+        try:
+            db.execute(f"ALTER TABLE images ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    db.commit()
+
+
+class RestoreStore:
+    """Restore points: a snapshot of the library taken before each risky change, plus a log of
+    every file the app moved, renamed or deleted. Kept in its own database so that restoring a
+    snapshot never rewinds the restore-point list itself."""
+
+    def __init__(self, lib, base=None):
+        self.lib = lib
+        self.base = Path(base) if base else RESTORE_DIR
+        self.trash = self.base / "trash"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.base / "restore.db", timeout=30)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS points(
+              id INTEGER PRIMARY KEY, created TEXT, label TEXT, kind TEXT, snapshot TEXT);
+            CREATE TABLE IF NOT EXISTS moves(
+              id INTEGER PRIMARY KEY, point_id INTEGER, op TEXT, old_path TEXT, new_path TEXT);
+        """)
+
+    @staticmethod
+    def norm(p):
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(p))))
+
+    def in_trash(self, p):
+        return self.norm(p).startswith(self.norm(self.trash) + os.sep)
+
+    # ---- points
+    def begin(self, label, kind="auto"):
+        """Snapshot the library now. Returns the point id, or None if a snapshot could not be made."""
+        self.lib.commit()
+        cur = self.db.execute("INSERT INTO points(created,label,kind,snapshot) VALUES(?,?,?,?)",
+                              (datetime.now().isoformat(timespec="seconds"), label, kind, ""))
+        pid = cur.lastrowid
+        snap, tmp = self.base / f"snap_{pid}.db.gz", self.base / f"snap_{pid}.tmp"
+        try:
+            dst = sqlite3.connect(tmp)
+            self.lib.backup(dst)
+            dst.close()
+            with open(tmp, "rb") as f, gzip.open(snap, "wb", compresslevel=3) as g:
+                shutil.copyfileobj(f, g)
+            self.db.execute("UPDATE points SET snapshot=? WHERE id=?", (snap.name, pid))
+            self.db.commit()
+            return pid
+        except Exception:
+            self.db.execute("DELETE FROM points WHERE id=?", (pid,))
+            self.db.commit()
+            snap.unlink(missing_ok=True)
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def log_move(self, pid, op, old, new):
+        self.db.execute("INSERT INTO moves(point_id,op,old_path,new_path) VALUES(?,?,?,?)",
+                        (pid, op, str(old), str(new)))
+        self.db.commit()
+
+    def end(self, pid, changed=True):
+        if changed:
+            self.prune()
+        else:
+            self.discard(pid)
+
+    def discard(self, pid):
+        row = self.db.execute("SELECT snapshot FROM points WHERE id=?", (pid,)).fetchone()
+        if row and row[0]:
+            (self.base / row[0]).unlink(missing_ok=True)
+        self.db.execute("DELETE FROM moves WHERE point_id=?", (pid,))
+        self.db.execute("DELETE FROM points WHERE id=?", (pid,))
+        self.db.commit()
+
+    def points(self):
+        return self.db.execute(
+            "SELECT id, created, label, kind FROM points ORDER BY id DESC").fetchall()
+
+    def summary(self, pid):
+        rows = self.db.execute("SELECT op, COUNT(*) FROM moves WHERE point_id=? GROUP BY op", (pid,))
+        return dict(rows.fetchall())
+
+    def prune(self, keep=None):
+        keep = MAX_POINTS if keep is None else keep
+        old = self.db.execute("SELECT id, snapshot FROM points ORDER BY id DESC LIMIT -1 OFFSET ?",
+                              (keep,)).fetchall()
+        for pid, snap in old:
+            # files still sitting in the app trash go to the Windows Recycle Bin, never silently destroyed
+            for (new,) in self.db.execute("SELECT new_path FROM moves WHERE point_id=?",
+                                          (pid,)).fetchall():
+                if self.in_trash(new) and os.path.exists(new):
+                    try:
+                        to_recycle_bin(new)
+                    except OSError:
+                        pass
+            self.db.execute("DELETE FROM moves WHERE point_id=?", (pid,))
+            self.db.execute("DELETE FROM points WHERE id=?", (pid,))
+            if snap:
+                (self.base / snap).unlink(missing_ok=True)
+            try:
+                (self.trash / str(pid)).rmdir()
+            except OSError:
+                pass
+        self.db.commit()
+
+    # ---- trash
+    def trash_file(self, pid, path):
+        d = self.trash / str(pid)
+        d.mkdir(parents=True, exist_ok=True)
+        dest = unique_path(d / Path(path).name)
+        shutil.move(str(path), str(dest))  # instant on the same drive, copy + delete across drives
+        self.log_move(pid, "trash", path, dest)
+        return dest
+
+    def trash_size(self):
+        total = 0
+        for dp, _, names in os.walk(self.trash):
+            for n in names:
+                try:
+                    total += os.path.getsize(os.path.join(dp, n))
+                except OSError:
+                    pass
+        return total
+
+    def empty_trash(self):
+        """Send everything in the app trash to the Windows Recycle Bin (no longer undoable here)."""
+        n = 0
+        for mid, new in self.db.execute("SELECT id, new_path FROM moves").fetchall():
+            if self.in_trash(new) and os.path.exists(new):
+                try:
+                    to_recycle_bin(new)
+                    self.db.execute("UPDATE moves SET op='recycled' WHERE id=?", (mid,))
+                    n += 1
+                except OSError:
+                    pass
+        self.db.commit()
+        return n
+
+    # ---- restoring
+    def _ids_from(self, point_id):
+        return [r[0] for r in self.db.execute(
+            "SELECT id FROM points WHERE id>=? ORDER BY id DESC", (point_id,))]
+
+    def revert_plan(self, point_id):
+        """Dry run of undoing every point from point_id to the newest.
+        Returns (point ids, [(from, to)] file moves, [(path, reason)] problems)."""
+        ids = self._ids_from(point_id)
+        added, removed = set(), set()
+
+        def exists(p):
+            n = self.norm(p)
+            return n in added or (n not in removed and os.path.exists(p))
+
+        steps, problems = [], []
+        for pid in ids:
+            for op, old, new in self.db.execute(
+                    "SELECT op, old_path, new_path FROM moves WHERE point_id=? ORDER BY id DESC",
+                    (pid,)).fetchall():
+                if op == "recycled":
+                    problems.append((old, "is in the Windows Recycle Bin, restore it from there"))
+                elif not exists(new):
+                    problems.append((old, f"the file is no longer at {new}"))
+                elif exists(old):
+                    problems.append((old, "something already exists at the original location"))
+                else:
+                    steps.append((new, old))
+                    nn, no = self.norm(new), self.norm(old)
+                    removed.add(nn)
+                    added.discard(nn)
+                    added.add(no)
+                    removed.discard(no)
+        return ids, steps, problems
+
+    def revert(self, point_id, log_pid):
+        """Really move the files back (newest change first), logging each move under log_pid."""
+        done, problems = 0, []
+        for pid in self._ids_from(point_id):
+            for op, old, new in self.db.execute(
+                    "SELECT op, old_path, new_path FROM moves WHERE point_id=? ORDER BY id DESC",
+                    (pid,)).fetchall():
+                if op == "recycled":
+                    problems.append((old, "is in the Windows Recycle Bin, restore it from there"))
+                elif not os.path.exists(new):
+                    problems.append((old, f"the file is no longer at {new}"))
+                elif os.path.exists(old):
+                    problems.append((old, "something already exists at the original location"))
+                else:
+                    try:
+                        os.makedirs(os.path.dirname(old), exist_ok=True)
+                        shutil.move(new, old)
+                        if log_pid is not None:
+                            self.log_move(log_pid, "move", new, old)
+                        done += 1
+                    except OSError as e:
+                        problems.append((old, str(e)))
+        return done, problems
+
+    def restore_library(self, point_id):
+        """Put the library database back to the snapshot (app settings such as theme are kept)."""
+        snap = self.db.execute("SELECT snapshot FROM points WHERE id=?", (point_id,)).fetchone()[0]
+        self.lib.commit()
+        settings = self.lib.execute("SELECT key, value FROM settings").fetchall()
+        tmp = self.base / "restore_tmp.db"
+        try:
+            with gzip.open(self.base / snap, "rb") as g, open(tmp, "wb") as f:
+                shutil.copyfileobj(g, f)
+            src = sqlite3.connect(tmp)
+            src.backup(self.lib)
+            src.close()
+        finally:
+            tmp.unlink(missing_ok=True)
+        ensure_schema(self.lib)  # the snapshot may predate newer columns
+        self.lib.executemany("INSERT OR REPLACE INTO settings VALUES(?,?)", settings)
+        self.lib.commit()
+
+
 def file_hash(p):
     h = hashlib.sha1()
     with open(p, "rb") as f:
@@ -335,13 +561,12 @@ class App:
         root.title("Image Library")
         root.geometry("1280x740")
         self.db = sqlite3.connect(DB_PATH, timeout=30)
-        self.db.executescript(SCHEMA)
-        for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0", "phash TEXT"):
-            try:
-                self.db.execute(f"ALTER TABLE images ADD COLUMN {col}")
-            except sqlite3.OperationalError:
-                pass  # column already exists
+        ensure_schema(self.db)
         self.backup_library()
+        try:
+            self.restore = RestoreStore(self.db)
+        except Exception:  # e.g. folder not writable: the app still works, just without restore points
+            self.restore = None
         self.page, self.rows, self.total = 0, [], 0
         self.cache, self.cols = {}, 5
         self.normal_bg = root.cget("bg")
@@ -405,6 +630,7 @@ class App:
             side="left")
         ttk.Button(top2, text="Watch folders…", command=self.watch_dialog).pack(side="left", padx=4)
         ttk.Button(top2, text="Find similar…", command=self.similar_dialog).pack(side="left")
+        ttk.Button(top2, text="Restore points…", command=self.restore_dialog).pack(side="left", padx=4)
         self.prog = ttk.Frame(top2)  # shown only while a folder is being indexed
         self.prog_label = ttk.Label(self.prog, text="")
         self.prog_label.pack(side="left", padx=6)
@@ -776,6 +1002,7 @@ class App:
         tags = self.parse_tags()
         if not self.selected or not tags:
             return
+        self.bulk_point(f"Add tags to {len(self.selected)} images")
         self.db.executemany("INSERT OR IGNORE INTO tags VALUES(?,?)",
                             [(i, t) for i in self.selected for t in tags])
         self.db.commit()
@@ -786,6 +1013,7 @@ class App:
         tags = self.parse_tags()
         if not self.selected or not tags:
             return
+        self.bulk_point(f"Remove tags from {len(self.selected)} images")
         self.db.executemany("DELETE FROM tags WHERE image_id=? AND tag=?",
                             [(i, t) for i in self.selected for t in tags])
         self.db.commit()
@@ -802,6 +1030,7 @@ class App:
     def apply_fav(self):
         if not self.selected:
             return
+        self.bulk_point(f"Change favourite on {len(self.selected)} images")
         v = int(self.fav_var.get())
         ids = list(self.selected)
         self.db.execute(f"UPDATE images SET fav=? WHERE id IN ({','.join('?' * len(ids))})",
@@ -817,6 +1046,7 @@ class App:
     def apply_rating(self):
         if not self.selected:
             return
+        self.bulk_point(f"Change rating on {len(self.selected)} images")
         ids = list(self.selected)
         self.db.execute(f"UPDATE images SET rating=? WHERE id IN ({','.join('?' * len(ids))})",
                         [int(self.rating_var.get())] + ids)
@@ -932,6 +1162,167 @@ class App:
                 self.refresh()  # nothing to lose, so show the new images straight away
             else:
                 self.refresh_sidebar()
+
+    # ---------- restore points ----------
+    def begin_point(self, label, kind="auto"):
+        if not self.restore:
+            return None
+        try:
+            return self.restore.begin(label, kind)
+        except Exception:
+            return None
+
+    def end_point(self, rp, changed):
+        if rp is not None and self.restore:
+            try:
+                self.restore.end(rp, changed)
+            except Exception:
+                pass
+
+    def log_move(self, rp, op, old, new):
+        if rp is not None and self.restore:
+            self.restore.log_move(rp, op, old, new)
+
+    def bulk_point(self, label):
+        """Restore point for changes to many images at once (single-image tweaks don't need one)."""
+        if len(self.selected) >= BULK_MIN:
+            self.end_point(self.begin_point(label), True)
+
+    def trash_file(self, rp, path):
+        if rp is not None and self.restore:
+            self.restore.trash_file(rp, path)
+        else:
+            to_recycle_bin(path)  # no restore point available: fall back to the Recycle Bin
+
+    def do_restore(self, point_id, label):
+        rp = self.begin_point(f"Before restoring to: {label}")  # so the restore can itself be undone
+        done, problems = self.restore.revert(point_id, rp)
+        self.restore.restore_library(point_id)
+        self.end_point(rp, True)
+        self.cache.clear()
+        self.refresh()
+        return done, problems
+
+    def restore_dialog(self):
+        if not self.restore:
+            messagebox.showinfo("Restore points", "Restore points are not available "
+                                "(the restore folder next to the app could not be created).")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Restore points")
+        win.geometry("900x580")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, wraplength=860, justify="left", text=(
+            "A restore point is a snapshot of your library taken just before a risky change. "
+            "Restoring returns the library, and every file the app renamed, moved or deleted, to how "
+            "they were just before that change, and undoes all later changes too. "
+            "Deleted files wait in the app trash until their restore point is pruned.")
+        ).pack(anchor="w", padx=12, pady=10)
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12)
+        lb = tk.Listbox(body, width=52, exportselection=False, activestyle="none")
+        lb.pack(side="left", fill="y")
+        box = tk.Text(body, wrap="word", state="disabled")
+        box.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        status = ttk.Label(win, text="")
+        status.pack(anchor="w", padx=12, pady=4)
+        pts = []
+
+        def show(text):
+            box.config(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.config(state="disabled")
+
+        def reload():
+            pts[:] = self.restore.points()
+            lb.delete(0, "end")
+            for pid, created, label, kind in pts:
+                stamp = datetime.fromisoformat(created).strftime("%d %b %Y %H:%M")
+                lb.insert("end", f"{stamp} · {label}")
+            status.config(text=f"{len(pts)} restore points (the newest {MAX_POINTS} are kept) · "
+                               f"app trash holds {self.restore.trash_size() / 1048576:.1f} MB")
+            show("Select a restore point to see what restoring to it would do." if pts else
+                 "No restore points yet. One is made automatically before risky changes such as "
+                 "renaming, moving or deleting files, and bulk edits.")
+
+        def picked():
+            sel = lb.curselection()
+            return pts[sel[0]] if sel else None
+
+        def preview(event=None):
+            p = picked()
+            if not p:
+                return
+            ids, steps, problems = self.restore.revert_plan(p[0])
+            own = self.restore.summary(p[0])
+            lines = [f"Restore to: {p[2]}", f"Taken: {p[1].replace('T', ' ')}", "",
+                     f"Restoring undoes {len(ids)} operation(s), newest first.",
+                     f"Files that will be moved back: {len(steps)}",
+                     f"Files that cannot be put back: {len(problems)}"]
+            if own:
+                lines += ["", "This point itself recorded: " + ", ".join(f"{n} {op}" for op, n in own.items())]
+            for path, why in problems[:40]:
+                lines.append(f"  - {path}: {why}")
+            if len(problems) > 40:
+                lines.append(f"  ... and {len(problems) - 40} more")
+            if problems:
+                lines += ["", "Those files are skipped; their library entries come back but show as missing."]
+            show("\n".join(lines))
+
+        def restore_now():
+            p = picked()
+            if not p:
+                return
+            if self.index_job:
+                messagebox.showinfo("Restore", "Wait for the running import to finish first.", parent=win)
+                return
+            ids, steps, problems = self.restore.revert_plan(p[0])
+            msg = (f"Restore to \"{p[2]}\"?\n\nThis undoes {len(ids)} operation(s), moves {len(steps)} "
+                   f"files back and puts the library back as it was.")
+            if problems:
+                msg += f"\n\n{len(problems)} files cannot be put back and will be skipped."
+            msg += "\n\nA new restore point is made first, so you can undo the restore."
+            if not messagebox.askyesno("Restore", msg, parent=win):
+                return
+            done, bad = self.do_restore(p[0], p[2])
+            reload()
+            show(f"Restored. {done} files moved back."
+                 + ("".join(f"\n  - {path}: {why}" for path, why in bad[:40]) if bad else ""))
+
+        def make_point():
+            name = simpledialog.askstring("Restore point", "Name for this restore point:", parent=win)
+            if name and name.strip():
+                self.end_point(self.begin_point(f"Manual: {name.strip()}", "manual"), True)
+                reload()
+
+        def empty_trash():
+            if not messagebox.askyesno(
+                    "Empty app trash",
+                    "Send everything in the app trash to the Windows Recycle Bin?\n"
+                    "Those deletions can then no longer be undone from here.", parent=win):
+                return
+            n = self.restore.empty_trash()
+            reload()
+            show(f"Sent {n} files to the Windows Recycle Bin.")
+
+        def open_trash():
+            self.restore.trash.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(self.restore.trash)
+            else:
+                subprocess.run(["xdg-open", str(self.restore.trash)])
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="Restore to this point…", command=restore_now).pack(side="left")
+        ttk.Button(btns, text="Create restore point…", command=make_point).pack(side="left", padx=6)
+        ttk.Button(btns, text="Open trash folder", command=open_trash).pack(side="left")
+        ttk.Button(btns, text="Empty trash…", command=empty_trash).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        lb.bind("<<ListboxSelect>>", preview)
+        reload()
 
     # ---------- light / dark theme ----------
     def toggle_theme(self):
@@ -1100,7 +1491,7 @@ class App:
 
         action = ttk.Frame(win)
         action.pack(fill="x", padx=12, pady=10)
-        apply_btn = ttk.Button(action, text="Apply to this group (unticked go to Recycle Bin)")
+        apply_btn = ttk.Button(action, text="Apply to this group (unticked go to the trash, undoable)")
         apply_btn.pack(side="left")
         skip_btn = ttk.Button(action, text="Skip group")
         skip_btn.pack(side="left", padx=6)
@@ -1170,7 +1561,7 @@ class App:
             if drop:
                 done, failed, freed = self.delete_dups(
                     [((keep[0]["id"], keep[0]["path"]), [(d["id"], d["path"]) for d in drop])])
-                status.config(text=f"Sent {done} to the Recycle Bin ({freed / 1048576:.1f} MB)"
+                status.config(text=f"Moved {done} to the trash ({freed / 1048576:.1f} MB), undo from Restore points"
                               + (f", {failed} failed" if failed else ""))
             remove_group(gid)
 
@@ -1190,11 +1581,11 @@ class App:
             extras = sum(len(x) for _, x in plan)
             if not messagebox.askyesno(
                     "Keep the largest",
-                    f"Keep the largest image in each of {len(plan)} groups and send the other "
-                    f"{extras} to the Recycle Bin?\nYou can restore them from there.", parent=win):
+                    f"Keep the largest image in each of {len(plan)} groups and move the other "
+                    f"{extras} to the app trash?\nYou can undo this from Restore points.", parent=win):
                 return
             done, failed, freed = self.delete_dups(plan)
-            messagebox.showinfo("Done", f"Sent {done} files to the Recycle Bin "
+            messagebox.showinfo("Done", f"Moved {done} files to the trash "
                                 f"({freed / 1048576:.1f} MB).\nFailed: {failed}", parent=win)
             st["groups"] = []
             fill_groups()
@@ -1367,6 +1758,7 @@ class App:
                 f"current search / filter (every page)?"):
             return
         w, p = self.where()
+        self.end_point(self.begin_point(f"Mark {self.total} images as {kind}"), True)
         self.db.execute("UPDATE images SET kind=?" + w, [kind] + p)
         self.db.commit()
         self.status.config(text=f"Marked {self.total} as {kind}")
@@ -1473,7 +1865,9 @@ class App:
                 f"{len(missing)} library entries point to files that no longer exist.\n"
                 f"Remove them from the library? No image files are touched.{warn}"):
             return
+        rp = self.begin_point(f"Remove {len(missing)} missing entries")
         self.remove_entries(missing)
+        self.end_point(rp, True)
         self.status.config(text=f"Removed {len(missing)} missing entries")
         self.cache.clear()
         self.refresh()
@@ -1500,13 +1894,15 @@ class App:
         return plan
 
     def delete_dups(self, plan):
-        """Recycle the extra copies; tags, favourite and rating are merged into the kept copy."""
+        """Move the extra copies to the app trash (undoable from Restore points); tags, favourite
+        and rating are merged into the kept copy."""
         done = failed = freed = 0
+        rp = self.begin_point(f"Delete {sum(len(o) for _, o in plan)} duplicate files")
         for keep, others in plan:
             for iid, path in others:
                 try:
                     size = os.path.getsize(path)
-                    to_recycle_bin(path)
+                    self.trash_file(rp, path)
                 except OSError:
                     failed += 1
                     continue
@@ -1521,6 +1917,7 @@ class App:
                 freed += size
                 done += 1
         self.db.commit()
+        self.end_point(rp, done > 0)
         return done, failed, freed
 
     def delete_duplicates_dialog(self):
@@ -1568,13 +1965,13 @@ class App:
                 return
             if not messagebox.askyesno(
                     "Delete duplicates",
-                    f"Send {extras} extra copies to the Recycle Bin?\n"
-                    "You can restore them from there. Tags, favourites and ratings are kept on the copy you keep.",
+                    f"Move {extras} extra copies to the app trash?\n"
+                    "You can undo this from Restore points. Tags, favourites and ratings are kept on the copy you keep.",
                     parent=win):
                 return
             done, failed, freed = self.delete_dups(plan)
             messagebox.showinfo("Delete duplicates",
-                                f"Sent {done} files to the Recycle Bin ({freed / 1048576:.1f} MB).\n"
+                                f"Moved {done} files to the trash ({freed / 1048576:.1f} MB).\n"
                                 f"Failed: {failed}", parent=win)
             win.destroy()
             self.cache.clear()
@@ -1582,7 +1979,7 @@ class App:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="Send extras to Recycle Bin", command=run).pack(side="right")
+        ttk.Button(btns, text="Move extras to trash", command=run).pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=6)
         preview()
 
@@ -1671,6 +2068,7 @@ class App:
                     f"Rename {len(items)} files on disk?\nThis changes the real filenames.",
                     parent=win):
                 return
+            rp = self.begin_point(f"Rename {len(items)} files")
             done = missing = failed = 0
             for iid, src, tgt in items:
                 if not src.exists():
@@ -1681,11 +2079,13 @@ class App:
                 try:
                     tgt = unique_path(tgt)
                     src.rename(tgt)
+                    self.log_move(rp, "rename", str(src), str(tgt))
                     self.db.execute("UPDATE images SET path=? WHERE id=?", (str(tgt), iid))
                     done += 1
                 except (OSError, sqlite3.IntegrityError):
                     failed += 1
             self.db.commit()
+            self.end_point(rp, done > 0)
             messagebox.showinfo("Rename finished",
                                 f"Renamed {done} files.\nMissing skipped: {missing}\nFailed: {failed}",
                                 parent=win)
@@ -1793,6 +2193,7 @@ class App:
                     "Move files", f"Move {len(rows)} files into '{dest}'?", parent=win):
                 return
             dest, mode = Path(dest), mode_var.get()
+            rp = self.begin_point(f"Move {len(rows)} files into folders") if move else None
             done = missing = failed = 0
             for n, r in enumerate(rows):
                 src = Path(r[1])
@@ -1807,6 +2208,7 @@ class App:
                     target = unique_path(target)
                     if move:
                         shutil.move(str(src), str(target))
+                        self.log_move(rp, "move", str(src), str(target))
                         self.db.execute("UPDATE images SET path=? WHERE id=?", (str(target), r[0]))
                     else:
                         shutil.copy2(src, target)
@@ -1817,6 +2219,8 @@ class App:
                     status.config(text=f"Working… {done} done")
                     win.update_idletasks()
             self.db.commit()
+            if move:
+                self.end_point(rp, done > 0)
             messagebox.showinfo(
                 "Sort finished",
                 f"{'Moved' if move else 'Copied'} {done} images.\n"

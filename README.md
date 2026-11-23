@@ -9,6 +9,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Add folder**: index a folder and all its subfolders in the background, with a progress bar and Cancel button. Re-adding a folder only picks up new images and skips known files without reading them.
 - **Watch folders**: choose folders to monitor. New images are added automatically at startup and then every minute while the app is open. Files still being downloaded are skipped until they finish.
 - **Drag and drop**: drop folders or image files onto the window to add them (needs the optional `tkinterdnd2` package, see below).
+- **Restore points**: before risky changes (bulk rename, move-sort, deleting duplicates, clean up, bulk tag/rating/favourite on 10+ images) the app snapshots your library and logs every file it moves, renames or deletes. **Restore points…** previews and restores to any of the newest 20, undoing later changes too. Deleted duplicates wait in the app trash (`restore/trash`), so they come back with the restore. Copy-mode sorting is not covered, and edits made to image contents outside the app are not reverted.
 - **Dark mode**: toggle in the top bar; your choice is remembered.
 - **Thumbnail size**: slider in the bottom bar (80 to 280 px) or Ctrl + mouse wheel over the grid; remembered between sessions.
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
@@ -22,8 +23,8 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter, 0-5 rates, F toggles favourite, Esc closes.
 - **Sort**: newest, oldest, name A-Z / Z-A, highest rated, favourites first.
 - **Find duplicates**: lists exact copies, grouped into sets.
-- **Find similar**: finds look-alike images (the same picture resized, re-saved at another quality, or with slightly different brightness). Pick a strictness, review each group side by side, tick the ones to keep (the largest is ticked by default) and the rest go to the Recycle Bin. It does not detect rotated, flipped or heavily cropped copies.
-- **Delete duplicates**: choose which copy to keep, preview the sets, then send the extras to the Recycle Bin. Tags, favourite and rating are merged into the copy you keep.
+- **Find similar**: finds look-alike images (the same picture resized, re-saved at another quality, or with slightly different brightness). Pick a strictness, review each group side by side, tick the ones to keep (the largest is ticked by default) and the rest go to the app trash (undoable). It does not detect rotated, flipped or heavily cropped copies.
+- **Delete duplicates**: choose which copy to keep, preview the sets, then move the extras to the app trash (undoable). Tags, favourite and rating are merged into the copy you keep.
 - **Clean up missing files**: remove library entries whose files have been deleted or moved (no image files are touched).
 - **Copy prompt**: copies the embedded prompt of the selected image to the clipboard.
 - **Sort into folders**: copy or move the selected images, everything showing, or the whole library into a structure you pick:
