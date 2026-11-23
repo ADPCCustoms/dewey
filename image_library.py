@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS images(
 CREATE TABLE IF NOT EXISTS tags(
   image_id INTEGER, tag TEXT, UNIQUE(image_id, tag));
 CREATE TABLE IF NOT EXISTS watch(folder TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS albums(
+  id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, pos INTEGER);
+CREATE TABLE IF NOT EXISTS album_images(
+  album_id INTEGER, image_id INTEGER, UNIQUE(album_id, image_id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -39,6 +43,7 @@ SORT_MODES = [
     ("kind", "Type   (Photos, AI Images, Other)"),
     ("kind_ym", "Type, then Year / Month"),
     ("tag", "Tag   (first tag; untagged go in 'Untagged')"),
+    ("album", "Album   (a folder per album; images in none go in 'No album')"),
 ]
 KIND_NAMES = {"photo": "Photos", "ai": "AI Images", "other": "Other"}
 
@@ -686,6 +691,7 @@ class App:
         self.side_list = tk.Listbox(side, exportselection=False, activestyle="none")
         self.side_list.pack(fill="both", expand=True)
         self.side_list.bind("<<ListboxSelect>>", self.on_side_select)
+        self.side_list.bind("<Button-3>", self.on_side_menu)
 
         # detail panel (right)
         d = ttk.Frame(main, width=310)
@@ -716,6 +722,13 @@ class App:
                           values=["0", "1", "2", "3", "4", "5"])
         rc.pack(side="left")
         rc.bind("<<ComboboxSelected>>", lambda e: self.apply_rating())
+        arow = ttk.Frame(d)
+        arow.pack(fill="x", pady=(0, 4))
+        self.album_btn = ttk.Menubutton(arow, text="Add to album ▾")
+        self.album_menu = tk.Menu(self.album_btn, tearoff=0, postcommand=self.fill_album_menu)
+        self.album_btn.config(menu=self.album_menu)
+        self.album_btn.pack(side="left")
+        ttk.Button(arow, text="Remove from album", command=self.remove_from_album).pack(side="left", padx=4)
         row = ttk.Frame(d)
         row.pack(fill="x")
         ttk.Button(row, text="View", command=lambda: self.open_viewer(self.primary)).pack(side="left")
@@ -789,6 +802,9 @@ class App:
             sql += " AND id NOT IN (SELECT image_id FROM tags)"
         elif mode == "tag":
             sql += " AND id IN (SELECT image_id FROM tags WHERE tag=?)"
+            params.append(val)
+        elif mode == "album":
+            sql += " AND id IN (SELECT image_id FROM album_images WHERE album_id=?)"
             params.append(val)
         if self.kind_var.get() != "all":
             sql += " AND kind=?"
@@ -931,6 +947,10 @@ class App:
             ("Untagged", ("untagged", None),
              count("SELECT COUNT(*) FROM images WHERE id NOT IN (SELECT image_id FROM tags)")),
         ]
+        for aid, name, n in self.db.execute(
+                "SELECT a.id, a.name, COUNT(ai.image_id) FROM albums a "
+                "LEFT JOIN album_images ai ON ai.album_id=a.id GROUP BY a.id ORDER BY a.pos, a.name"):
+            items.append((f"▣ {name}", ("album", aid), n))
         for tag, n in self.db.execute("SELECT tag, COUNT(*) FROM tags GROUP BY tag ORDER BY tag"):
             items.append((f"# {tag}", ("tag", tag), n))
         self.side_items = items
@@ -1012,6 +1032,11 @@ class App:
         except Exception:
             self.preview.config(image="", text="(file missing)")
         extra = f"\n{len(self.selected)} images selected" if len(self.selected) > 1 else ""
+        names = [r[0] for r in self.db.execute(
+            "SELECT a.name FROM albums a JOIN album_images ai ON ai.album_id=a.id "
+            "WHERE ai.image_id=? ORDER BY a.pos, a.name", (iid,))]
+        if names:
+            extra = f"\nAlbums: {', '.join(names)}" + extra
         self.info.config(text=f"{Path(path).name}\n{kind} · {taken[:10]}\n{path}{extra}")
         tags = [r[0] for r in self.db.execute(
             "SELECT tag FROM tags WHERE image_id=? ORDER BY tag", (iid,))]
@@ -1199,6 +1224,134 @@ class App:
                 self.refresh()  # nothing to lose, so show the new images straight away
             else:
                 self.refresh_sidebar()
+
+    # ---------- albums (virtual: nothing is moved or copied unless you export) ----------
+    def albums(self):
+        return self.db.execute("SELECT id, name FROM albums ORDER BY pos, name").fetchall()
+
+    def fill_album_menu(self):
+        m = self.album_menu
+        m.delete(0, "end")
+        albums = self.albums()
+        for aid, name in albums:
+            m.add_command(label=name, command=lambda a=aid: self.add_to_album(a))
+        if albums:
+            m.add_separator()
+        m.add_command(label="New album…", command=self.new_album)
+
+    def new_album(self):
+        name = simpledialog.askstring("New album", "Album name:", parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        try:
+            pos = self.db.execute("SELECT COALESCE(MAX(pos), 0) + 1 FROM albums").fetchone()[0]
+            cur = self.db.execute("INSERT INTO albums(name, pos) VALUES(?, ?)", (name, pos))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showinfo("New album", f"An album called '{name}' already exists.")
+            return
+        if self.selected:
+            self.add_to_album(cur.lastrowid)  # a new album made with images selected starts with them
+        else:
+            self.refresh_sidebar()
+
+    def add_to_album(self, aid):
+        if not self.selected:
+            messagebox.showinfo("Albums", "Select one or more images first.")
+            return
+        name = self.db.execute("SELECT name FROM albums WHERE id=?", (aid,)).fetchone()[0]
+        self.bulk_point(f"Add {len(self.selected)} images to album {name}")
+        self.db.executemany("INSERT OR IGNORE INTO album_images VALUES(?,?)",
+                            [(aid, i) for i in self.selected])
+        self.db.commit()
+        self.status.config(text=f"Added {len(self.selected)} image(s) to '{name}'")
+        self.refresh_sidebar()
+        self.show_detail(self.primary)
+
+    def remove_from_album(self):
+        mode, aid = self.side_filter
+        if mode != "album":
+            self.status.config(text="Open an album in the sidebar first, then select its images")
+            return
+        if not self.selected:
+            self.status.config(text="Select the images to remove from this album")
+            return
+        self.bulk_point(f"Remove {len(self.selected)} images from an album")
+        self.db.executemany("DELETE FROM album_images WHERE album_id=? AND image_id=?",
+                            [(aid, i) for i in self.selected])
+        self.db.commit()
+        self.status.config(text=f"Removed {len(self.selected)} image(s) from the album (files untouched)")
+        self.refresh()
+
+    def show_album(self, aid):
+        self.side_filter = ("album", aid)
+        self.reset_page()
+
+    def on_side_menu(self, event):
+        i = self.side_list.nearest(event.y)
+        if i < 0 or i >= len(self.side_items) or self.side_items[i][1][0] != "album":
+            return
+        aid = self.side_items[i][1][1]
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Rename…", command=lambda: self.rename_album(aid))
+        m.add_command(label="Move up", command=lambda: self.move_album(aid, -1))
+        m.add_command(label="Move down", command=lambda: self.move_album(aid, 1))
+        m.add_separator()
+        m.add_command(label="Copy or move to a real folder…", command=lambda: self.export_album(aid))
+        m.add_separator()
+        m.add_command(label="Delete album…", command=lambda: self.delete_album(aid))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def rename_album(self, aid):
+        old = self.db.execute("SELECT name FROM albums WHERE id=?", (aid,)).fetchone()[0]
+        name = simpledialog.askstring("Rename album", "New name:", initialvalue=old, parent=self.root)
+        if not name or not name.strip() or name.strip() == old:
+            return
+        try:
+            self.db.execute("UPDATE albums SET name=? WHERE id=?", (name.strip(), aid))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showinfo("Rename album", f"An album called '{name.strip()}' already exists.")
+            return
+        self.refresh_sidebar()
+
+    def move_album(self, aid, delta):
+        ids = [r[0] for r in self.db.execute("SELECT id FROM albums ORDER BY pos, name")]
+        i = ids.index(aid)
+        j = i + delta
+        if not 0 <= j < len(ids):
+            return
+        ids[i], ids[j] = ids[j], ids[i]
+        self.db.executemany("UPDATE albums SET pos=? WHERE id=?", [(n, a) for n, a in enumerate(ids, 1)])
+        self.db.commit()
+        self.refresh_sidebar()
+
+    def delete_album(self, aid):
+        name = self.db.execute("SELECT name FROM albums WHERE id=?", (aid,)).fetchone()[0]
+        n = self.db.execute("SELECT COUNT(*) FROM album_images WHERE album_id=?", (aid,)).fetchone()[0]
+        if not messagebox.askyesno(
+                "Delete album",
+                f"Delete the album '{name}'?\n\nThe {n} images in it are not deleted or moved, only the "
+                "album is removed. You can undo this from Restore points."):
+            return
+        self.end_point(self.begin_point(f"Delete album {name}"), True)
+        self.db.execute("DELETE FROM album_images WHERE album_id=?", (aid,))
+        self.db.execute("DELETE FROM albums WHERE id=?", (aid,))
+        self.db.commit()
+        if self.side_filter == ("album", aid):
+            self.side_filter = ("all", None)
+            self.reset_page()
+        else:
+            self.refresh_sidebar()
+
+    def export_album(self, aid):
+        """Albums are virtual. This puts a real copy (or move) of the album's images in a folder."""
+        self.show_album(aid)
+        self.sort_dialog(scope="current", mode="album")
 
     # ---------- restore points ----------
     def begin_point(self, label, kind="auto"):
@@ -1451,6 +1604,8 @@ class App:
                 ("*Text.insertBackground", pal["fg"]), ("*Text.selectBackground", pal["sel"]),
                 ("*Text.selectForeground", pal["selfg"]),
                 ("*Canvas.background", pal["bg"]), ("*Toplevel.background", pal["bg"]),
+                ("*Menu.background", pal["field"]), ("*Menu.foreground", pal["fg"]),
+                ("*Menu.activeBackground", pal["sel"]), ("*Menu.activeForeground", pal["selfg"]),
                 ("*Label.background", pal["bg"]), ("*Label.foreground", pal["fg"]),
                 ("*Scale.background", pal["bg"]), ("*Scale.foreground", pal["fg"]),
                 ("*Scale.troughColor", pal["field"]),
@@ -1916,6 +2071,7 @@ class App:
 
     def remove_entries(self, ids):
         self.db.executemany("DELETE FROM tags WHERE image_id=?", [(i,) for i in ids])
+        self.db.executemany("DELETE FROM album_images WHERE image_id=?", [(i,) for i in ids])
         self.db.executemany("DELETE FROM images WHERE id=?", [(i,) for i in ids])
         self.db.commit()
 
@@ -1979,6 +2135,9 @@ class App:
                     "UPDATE images SET fav=MAX(fav, (SELECT fav FROM images WHERE id=?)), "
                     "rating=MAX(rating, (SELECT rating FROM images WHERE id=?)) WHERE id=?",
                     (iid, iid, keep[0]))
+                self.db.execute("INSERT OR IGNORE INTO album_images "
+                                "SELECT album_id, ? FROM album_images WHERE image_id=?", (keep[0], iid))
+                self.db.execute("DELETE FROM album_images WHERE image_id=?", (iid,))
                 self.db.execute("DELETE FROM tags WHERE image_id=?", (iid,))
                 self.db.execute("DELETE FROM images WHERE id=?", (iid,))
                 freed += size
@@ -2182,6 +2341,16 @@ class App:
         iid, _, taken, kind = row
         y, m = taken[:4], taken[5:7]
         kname = KIND_NAMES.get(kind, "Other")
+        if mode == "album":
+            ctx = self.side_filter[1] if self.side_filter[0] == "album" else None
+            r = None
+            if ctx:  # exporting the album being viewed: use it even if the image is in other albums too
+                r = self.db.execute("SELECT a.name FROM albums a JOIN album_images ai ON ai.album_id=a.id "
+                                    "WHERE a.id=? AND ai.image_id=?", (ctx, iid)).fetchone()
+            if not r:
+                r = self.db.execute("SELECT a.name FROM albums a JOIN album_images ai ON ai.album_id=a.id "
+                                    "WHERE ai.image_id=? ORDER BY a.pos, a.name LIMIT 1", (iid,)).fetchone()
+            return Path(safe_name(r[0]) if r else "No album")
         if mode == "y":
             return Path(y)
         if mode == "ym":
@@ -2194,14 +2363,14 @@ class App:
                             (iid,)).fetchone()
         return Path(safe_name(t[0]) if t else "Untagged")
 
-    def sort_dialog(self):
+    def sort_dialog(self, scope=None, mode=None):
         win = tk.Toplevel(self.root)
         win.title("Sort into folders")
         win.geometry("560x640")
         win.transient(self.root)
         win.grab_set()
-        scope_var = tk.StringVar(value="selected" if self.selected else "current")
-        mode_var = tk.StringVar(value="ym")
+        scope_var = tk.StringVar(value=scope or ("selected" if self.selected else "current"))
+        mode_var = tk.StringVar(value=mode or "ym")
         action_var = tk.StringVar(value="copy")
         dest_var = tk.StringVar()
 

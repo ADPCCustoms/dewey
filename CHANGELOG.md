@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.11
+- Albums: virtual collections in the sidebar (add, remove, rename, reorder, delete)
+- Right-click an album to copy or move its images into a real folder (new Album mode in Sort into folders)
+- Albums covered by restore points and carried across when duplicates are merged
+
 ## v1.10
 - Delete restore points by hand (multi-select), with an option to free the trash space they use
 - File moves of a deleted point are merged into the nearest older point, so older restore points keep working

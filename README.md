@@ -18,6 +18,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
 - **Select several images**: click, Ctrl-click to add or remove one, Shift-click for a range, or **Select page**.
 - **Tags**: add comma-separated tags to one image, or use **Add to all selected** / **Remove** to tag many at once.
 - **Browse sidebar**: All images, Favourites, Rated 4+, Untagged, and every tag with its count. Click one to filter.
+- **Albums**: hand-picked collections shown in the sidebar. They are virtual, so no files are moved or copied, and an image can be in several albums. Use **Add to album** in the side panel, **Remove from album** while an album is open, and right-click an album to rename, reorder, delete it, or copy or move its images into a real folder. Deleting an album never touches the images.
 - **Favourites and ratings**: mark a favourite (gold border in the grid) and give 0 to 5 stars, for one or many selected images.
 - **Rename in bulk**: patterns such as `{date}_{n:03}` using `{date}`, `{type}`, `{tag}`, `{name}` and a counter, with a preview first.
 - **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter, 0-5 rates, F toggles favourite, Esc closes.
@@ -33,6 +34,7 @@ Your original files are never changed. Nothing is moved or deleted unless you ch
   - Type (Photos, AI Images, Other)
   - Type, then Year / Month
   - Tag (first tag; untagged go in `Untagged`)
+  - Album (a folder per album; images in none go in `No album`)
 
   A preview shows the folders and image counts before anything happens.
 - **Mark showing as**: set the type (photo / ai / other) for every image matching the current search or filter.

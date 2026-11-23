@@ -1,8 +1,10 @@
-## What's new in v1.10
+## What's new in v1.11
 
-- Delete restore points by hand: select one or more in the Restore points window (Ctrl or Shift) and press Delete selected. This sits alongside the automatic pruning that keeps the newest 20
-- Deleting a point never breaks the others: the files it moved are handed to the nearest older point, so restoring to an older point still puts everything back
-- Optional tickbox to free the trash space used by the deleted points. Their deleted files then go to the Windows Recycle Bin, and older restore points can no longer bring those files back (they say so in the preview)
-- If nothing older exists to bring trashed files back, they go to the Recycle Bin automatically rather than being left behind or destroyed
+- Albums: hand-picked collections that appear in the sidebar with their image counts. They are virtual, so nothing is moved or copied, and one image can be in as many albums as you like
+- Add images from the new Add to album menu in the side panel (it also has New album…), and remove them with Remove from album while an album is open
+- Right-click an album in the sidebar to rename it, move it up or down, delete it, or copy or move its images into a real folder
+- Deleting an album never touches the images. Album deletions and changes to 10 or more images are covered by restore points
+- Sort into folders has a new Album mode that makes a real folder per album
+- The side panel shows which albums the selected image is in. Albums follow images when duplicates are merged, and entries are tidied when images leave the library
 
-Existing libraries and restore points work as they are.
+Existing libraries upgrade automatically on first launch.
