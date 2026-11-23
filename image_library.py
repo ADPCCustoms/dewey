@@ -18,6 +18,13 @@ except Exception:
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DB_PATH = BASE / "library.db"
+
+
+def resource_path(name):
+    """Files bundled into the exe (such as the icon) live in a temporary folder when frozen."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / name
+
+
 THUMB, PAGE = 140, 60
 SIZES = [80, 110, 140, 180, 220, 280]  # thumbnail sizes offered by the slider
 WATCH_MS = 60_000  # how often watched folders are checked
@@ -2496,6 +2503,10 @@ if __name__ == "__main__":
         root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     except Exception:  # drag-and-drop library present but not usable
         root = tk.Tk()
+    try:  # window, taskbar and dialog icon
+        root.iconbitmap(default=str(resource_path("icon.ico")))
+    except Exception:
+        pass
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

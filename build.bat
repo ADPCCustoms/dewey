@@ -8,7 +8,7 @@ set DND=
 python -c "import tkinterdnd2" 2>nul && set DND=--collect-all tkinterdnd2
 
 set ICON=
-if exist icon.ico set ICON=--icon icon.ico
+if exist icon.ico set ICON=--icon icon.ico --add-data "icon.ico;."
 
 echo Building ImageLibrary.exe...
 pyinstaller --onefile --windowed --name ImageLibrary %ICON% %DND% image_library.py

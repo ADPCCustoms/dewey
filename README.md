@@ -1,5 +1,7 @@
 # Image Library
 
+<p align="center"><img src="icon.png" width="128" alt="App icon"></p>
+
 A small desktop app for organising a mixed collection of images: photos, art and AI-generated pictures. It builds an index of your images, lets you tag and search them, finds duplicates, and can sort them into folders you choose.
 
 Your original files are never changed. Nothing is moved or deleted unless you choose **Move** in the sort dialog.
@@ -65,6 +67,8 @@ python image_library.py
 The library is saved as `library.db` next to the script (or next to the exe). On each launch it is health-checked and, if healthy, copied to `library.db.bak`. Thumbnails are cached in a `thumbs` folder next to it, which is safe to delete.
 
 ## Build an .exe (Windows)
+
+The exe and the window use `icon.ico`. `make_icon.py` draws it (run `python make_icon.py` after editing the colours or shapes).
 
 Double-click `build.bat`, or run:
 

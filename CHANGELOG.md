@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.12
+- New app icon (exe, window, taskbar, dialogs), drawn by make_icon.py
+
 ## v1.11
 - Albums: virtual collections in the sidebar (add, remove, rename, reorder, delete)
 - Right-click an album to copy or move its images into a real folder (new Album mode in Sort into folders)
