@@ -203,7 +203,8 @@ BULK_MIN = 10    # bulk tag / rating / favourite changes on at least this many i
 
 def ensure_schema(db):
     db.executescript(SCHEMA)
-    for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0", "phash TEXT"):
+    for col in ("fav INTEGER DEFAULT 0", "rating INTEGER DEFAULT 0", "phash TEXT",
+                "width INTEGER", "height INTEGER", "filesize INTEGER"):
         try:
             db.execute(f"ALTER TABLE images ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -467,6 +468,41 @@ def file_hash(p):
     return h.hexdigest()
 
 
+def image_details(p):
+    """(width, height, file size in bytes); zeros when the file cannot be read."""
+    try:
+        with Image.open(p) as im:
+            w, h = im.size
+    except Exception:
+        w = h = 0
+    try:
+        size = os.path.getsize(p)
+    except OSError:
+        size = 0
+    return w, h, size
+
+
+def details_worker(db_path, q, cancel):
+    """Fills in width / height / size for images added before those columns existed."""
+    try:
+        db = sqlite3.connect(db_path, timeout=30)
+        todo = db.execute("SELECT id, path FROM images WHERE width IS NULL").fetchall()
+        q.put(("total", len(todo)))
+        for n, (iid, path) in enumerate(todo, 1):
+            if cancel.is_set():
+                break
+            w, h, size = image_details(path)
+            db.execute("UPDATE images SET width=?, height=?, filesize=? WHERE id=?", (w, h, size, iid))
+            if n % 100 == 0:
+                db.commit()
+                q.put(("progress", n))
+        db.commit()
+        db.close()
+        q.put(("done", cancel.is_set()))
+    except Exception as e:
+        q.put(("error", str(e)))
+
+
 def index_worker(sources, db_path, q, cancel, settle=0):
     """Runs in a background thread with its own database connection.
     sources: folders and/or image files. settle: skip files modified in the last N seconds
@@ -502,8 +538,9 @@ def index_worker(sources, db_path, q, cancel, settle=0):
                         continue
                     p = Path(f)
                     taken, kind, prompt = file_info(p)
-                    db.execute("INSERT OR IGNORE INTO images(path,hash,taken,kind,prompt) "
-                               "VALUES(?,?,?,?,?)", (f, file_hash(p), taken, kind, prompt))
+                    w, h, size = image_details(p)
+                    db.execute("INSERT OR IGNORE INTO images(path,hash,taken,kind,prompt,width,height,filesize) "
+                               "VALUES(?,?,?,?,?,?,?,?)", (f, file_hash(p), taken, kind, prompt, w, h, size))
                     added += 1
                 except Exception:
                     failed += 1
@@ -626,6 +663,7 @@ class App:
         self.placeholder = None
         self.thumb_state, self.thumb_q, self.thumb_left = {"token": 0}, queue.Queue(), set()
         self.index_job, self.index_thread = None, None
+        self.detail_job = None
         self.default_theme = ttk.Style().theme_use()
         row = self.db.execute("SELECT value FROM settings WHERE key='theme'").fetchone()
         self.theme = row[0] if row and row[0] in THEMES else "light"
@@ -636,7 +674,9 @@ class App:
         self.refresh()
         self.apply_theme(self.theme)
         self.setup_dnd()
+        self.setup_keys()
         self.root.after(2000, self.watch_tick)
+        self.root.after(1500, self.start_details)
 
     # ---------- UI ----------
     def build_ui(self):
@@ -647,6 +687,7 @@ class App:
         self.search_var = tk.StringVar()
         e = ttk.Entry(top, textvariable=self.search_var, width=24)
         e.pack(side="left")
+        self.search_entry = e
         e.bind("<KeyRelease>", self.on_search_key)
         self.kind_var = tk.StringVar(value="all")
         cb = ttk.Combobox(top, textvariable=self.kind_var, width=8, state="readonly",
@@ -664,15 +705,20 @@ class App:
         self.status.pack(side="right")
         self.theme_btn = ttk.Button(top, text="Dark mode", command=self.toggle_theme)
         self.theme_btn.pack(side="right", padx=8)
+        ttk.Button(top, text="?", width=3, command=self.show_shortcuts).pack(side="right")
 
         top2 = ttk.Frame(self.root)
         top2.pack(fill="x", padx=8)
+        self.top2 = top2
         ttk.Label(top2, text="Sort:").pack(side="left")
         self.sort_var = tk.StringVar(value="Newest first")
         sc = ttk.Combobox(top2, textvariable=self.sort_var, width=16, state="readonly",
                           values=list(SORTS))
         sc.pack(side="left", padx=4)
         sc.bind("<<ComboboxSelected>>", lambda e: self.reset_page())
+        self.filter_btn = ttk.Button(top2, text="Filters ▾", command=self.toggle_filters)
+        self.filter_btn.pack(side="left", padx=(8, 0))
+        self.build_filter_bar()
         ttk.Button(top2, text="Clean up missing files…", command=self.cleanup_missing).pack(
             side="left", padx=(12, 4))
         ttk.Button(top2, text="Delete duplicates…", command=self.delete_duplicates_dialog).pack(
@@ -813,6 +859,38 @@ class App:
         elif mode == "album":
             sql += " AND id IN (SELECT image_id FROM album_images WHERE album_id=?)"
             params.append(val)
+        fv = getattr(self, "fvars", None)
+        if fv:  # detail filters: shape, size in pixels, file size, taken date, format
+            def num(key):
+                try:
+                    return float(fv[key].get().strip().replace(",", "."))
+                except ValueError:
+                    return None
+            o = fv["orient"].get()
+            if o == "Landscape":
+                sql += " AND width > height"
+            elif o == "Portrait":
+                sql += " AND height > width"
+            elif o == "Square":
+                sql += " AND width = height AND width > 0"
+            for key, col, op, scale in (("minw", "width", ">=", 1), ("minh", "height", ">=", 1),
+                                        ("minmb", "filesize", ">=", 1048576),
+                                        ("maxmb", "filesize", "<=", 1048576)):
+                v = num(key)
+                if v is not None:
+                    sql += f" AND {col} {op} ?"
+                    params.append(int(v * scale))
+            for key, op in (("dfrom", ">="), ("dto", "<=")):
+                d = fv[key].get().strip()
+                if re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", d):  # 2026, 2026-11 or 2026-11-25
+                    sql += f" AND substr(taken, 1, {len(d)}) {op} ?"
+                    params.append(d)
+            f = fv["fmt"].get()
+            if f == "JPG":
+                sql += " AND (lower(path) LIKE '%.jpg' OR lower(path) LIKE '%.jpeg')"
+            elif f != "Any":
+                sql += " AND lower(path) LIKE ?"
+                params.append("%." + f.lower())
         if self.kind_var.get() != "all":
             sql += " AND kind=?"
             params.append(self.kind_var.get())
@@ -979,6 +1057,7 @@ class App:
 
     # ---------- selection ----------
     def on_click(self, event, iid):
+        self.canvas.focus_set()  # so the keyboard shortcuts act on the grid
         ids = [r[0] for r in self.rows]
         shift, ctrl = event.state & 0x1, event.state & 0x4
         if shift and self.anchor in ids:
@@ -1360,6 +1439,239 @@ class App:
         self.show_album(aid)
         self.sort_dialog(scope="current", mode="album")
 
+    # ---------- detail filters ----------
+    FILTER_DEFAULTS = dict(orient="Any", minw="", minh="", minmb="", maxmb="", dfrom="", dto="", fmt="Any")
+
+    def build_filter_bar(self):
+        fb = ttk.Frame(self.root)
+        self.filter_bar, self.filters_open = fb, False
+        self.fvars = {k: tk.StringVar(value=v) for k, v in self.FILTER_DEFAULTS.items()}
+
+        def combo(label, key, values, width):
+            ttk.Label(fb, text=label).pack(side="left", padx=(8, 2))
+            c = ttk.Combobox(fb, textvariable=self.fvars[key], width=width, state="readonly", values=values)
+            c.pack(side="left")
+            c.bind("<<ComboboxSelected>>", lambda e: self.filters_changed())
+
+        def entry(label, key, width):
+            ttk.Label(fb, text=label).pack(side="left", padx=(8, 2))
+            e = ttk.Entry(fb, textvariable=self.fvars[key], width=width)
+            e.pack(side="left")
+            e.bind("<KeyRelease>", self.on_filter_key)
+
+        combo("Shape:", "orient", ["Any", "Landscape", "Portrait", "Square"], 10)
+        entry("Width ≥", "minw", 6)
+        entry("Height ≥", "minh", 6)
+        entry("Size MB ≥", "minmb", 5)
+        entry("≤", "maxmb", 5)
+        entry("Taken from", "dfrom", 10)
+        entry("to", "dto", 10)
+        combo("Format:", "fmt", ["Any", "PNG", "JPG", "WEBP", "GIF"], 6)
+        ttk.Button(fb, text="Clear filters", command=self.clear_filters).pack(side="left", padx=8)
+        ttk.Label(fb, text="dates: 2026, 2026-11 or 2026-11-25").pack(side="left")
+
+    def toggle_filters(self):
+        if self.filters_open:
+            self.filter_bar.pack_forget()
+        else:
+            self.filter_bar.pack(fill="x", padx=8, pady=(4, 0), after=self.top2)
+        self.filters_open = not self.filters_open
+
+    def active_filters(self):
+        return sum(1 for v in self.fvars.values() if v.get().strip() not in ("", "Any"))
+
+    def filters_changed(self):
+        n = self.active_filters()
+        self.filter_btn.config(text=f"Filters ({n}) ▾" if n else "Filters ▾")
+        self.reset_page()
+
+    def on_filter_key(self, _=None):
+        if self.debounce:
+            self.root.after_cancel(self.debounce)
+        self.debounce = self.root.after(400, self.filters_changed)
+
+    def clear_filters(self):
+        for k, v in self.FILTER_DEFAULTS.items():
+            self.fvars[k].set(v)
+        self.filters_changed()
+
+    # ---------- reading image sizes in the background (for images added before v1.14) ----------
+    def start_details(self):
+        if self.detail_job:
+            return
+        n = self.db.execute("SELECT COUNT(*) FROM images WHERE width IS NULL").fetchone()[0]
+        if not n:
+            return
+        q, cancel = queue.Queue(), threading.Event()
+        self.detail_job = (q, cancel)
+        threading.Thread(target=details_worker, args=(str(DB_PATH), q, cancel), daemon=True).start()
+        self.root.after(300, self.poll_details)
+
+    def poll_details(self):
+        if not self.detail_job:
+            return
+        q, total, finished = self.detail_job[0], 0, False
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "total":
+                    self.detail_total = msg[1]
+                    self.status.config(text=f"Reading sizes of {msg[1]} images for the filters…")
+                elif msg[0] == "progress":
+                    self.status.config(text=f"Reading image sizes… {msg[1]} of {getattr(self, 'detail_total', '?')}")
+                elif msg[0] in ("done", "error"):
+                    finished = True
+        except queue.Empty:
+            pass
+        if not finished:
+            self.root.after(300, self.poll_details)
+            return
+        self.detail_job = None
+        self.status.config(text="Image sizes ready for the filters")
+        if self.fvars and self.active_filters():
+            self.refresh()
+
+    # ---------- keyboard shortcuts ----------
+    def typing(self):
+        """True while a text box, dropdown or list has the keyboard, so letters and arrows stay theirs."""
+        w = self.root.focus_get()
+        return w is not None and w.winfo_class() in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox",
+                                                     "TSpinbox", "Listbox", "Scale", "TScale")
+
+    def setup_keys(self):
+        def on(seq, fn, typing_ok=False):
+            def run(event):
+                if not typing_ok and self.typing():
+                    return None
+                fn()
+                return "break"
+            self.root.bind(seq, run)
+
+        on("<F1>", self.show_shortcuts, True)
+        on("<F5>", self.refresh, True)
+        on("<Control-f>", self.focus_search, True)
+        on("<Control-Shift-F>", self.toggle_filters, True)
+        on("<Control-o>", self.add_folder, True)
+        on("<Control-a>", self.select_page)
+        on("<Escape>", self.clear_selection)
+        on("<Return>", lambda: self.open_viewer(self.primary))
+        on("<Delete>", self.delete_selected)
+        on("<Left>", lambda: self.move_selection(-1, 0))
+        on("<Right>", lambda: self.move_selection(1, 0))
+        on("<Up>", lambda: self.move_selection(0, -1))
+        on("<Down>", lambda: self.move_selection(0, 1))
+        on("<Home>", lambda: self.move_selection(-10 ** 6, 0))
+        on("<End>", lambda: self.move_selection(10 ** 6, 0))
+        on("<Prior>", lambda: self.change_page(-1))
+        on("<Next>", lambda: self.change_page(1))
+        for n in range(6):
+            on(f"<Key-{n}>", lambda n=n: self.rate_selected(n))
+        on("<Key-f>", self.toggle_fav)
+
+    def focus_search(self):
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, "end")
+
+    def rate_selected(self, n):
+        if self.selected:
+            self.rating_var.set(str(n))
+            self.apply_rating()
+
+    def toggle_fav(self):
+        if self.selected:
+            self.fav_var.set(not self.fav_var.get())
+            self.apply_fav()
+
+    def move_selection(self, dx, dy):
+        ids = [r[0] for r in self.rows]
+        if not ids:
+            return
+        cur = ids.index(self.primary) if self.primary in ids else None
+        n = 0 if cur is None else cur + dx + dy * self.cols
+        n = min(max(n, 0), len(ids) - 1)
+        self.selected, self.primary, self.anchor = {ids[n]}, ids[n], ids[n]
+        self.update_selection()
+        self.ensure_visible(ids[n])
+
+    def ensure_visible(self, iid):
+        w = self.widgets.get(iid)
+        if w is None:
+            return
+        self.canvas.update_idletasks()
+        top, bottom = self.canvas.yview()
+        total = max(1, self.grid_frame.winfo_height())
+        y0, y1 = w.winfo_y() / total, (w.winfo_y() + w.winfo_height()) / total
+        if y0 < top:
+            self.canvas.yview_moveto(y0)
+        elif y1 > bottom:
+            self.canvas.yview_moveto(max(0.0, y1 - (bottom - top)))
+
+    def delete_selected(self):
+        """Delete key: move the selected images to the app trash (undoable from Restore points)."""
+        ids = list(self.selected)
+        if not ids:
+            return
+        rows = self.db.execute(
+            f"SELECT id, path FROM images WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+        if not messagebox.askyesno(
+                "Delete images",
+                f"Move {len(rows)} image(s) to the app trash?\n\nThe files leave their folders and the "
+                "library entries are removed. You can undo this from Restore points."):
+            return
+        rp = self.begin_point(f"Delete {len(rows)} images")
+        done = failed = 0
+        for iid, path in rows:
+            try:
+                if os.path.exists(path):
+                    self.trash_file(rp, path)
+            except OSError:
+                failed += 1
+                continue
+            self.db.execute("DELETE FROM tags WHERE image_id=?", (iid,))
+            self.db.execute("DELETE FROM album_images WHERE image_id=?", (iid,))
+            self.db.execute("DELETE FROM images WHERE id=?", (iid,))
+            done += 1
+        self.db.commit()
+        self.end_point(rp, done > 0)
+        self.selected, self.primary = set(), None
+        self.status.config(text=f"Moved {done} image(s) to the trash" + (f", {failed} failed" if failed else ""))
+        self.cache.clear()
+        self.refresh()
+
+    def show_shortcuts(self):
+        win = tk.Toplevel(self.root)
+        win.title("Keyboard shortcuts")
+        win.geometry("560x560")
+        win.transient(self.root)
+        text = tk.Text(win, wrap="word", padx=14, pady=10)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", (
+            "Main window\n"
+            "  F1                    this list\n"
+            "  F5                    refresh\n"
+            "  Ctrl+F                jump to search\n"
+            "  Ctrl+Shift+F          show / hide the detail filters\n"
+            "  Ctrl+O                add a folder\n"
+            "  Ctrl+A                select the whole page\n"
+            "  Esc                   clear the selection\n"
+            "  Arrow keys            move the selection (Home / End: first / last on the page)\n"
+            "  Page Up / Page Down   previous / next page\n"
+            "  Enter                 open the full-size viewer\n"
+            "  Delete                move the selected images to the trash (undoable)\n"
+            "  0 to 5                set the rating of the selected images\n"
+            "  F                     toggle favourite on the selected images\n"
+            "  Ctrl + mouse wheel    thumbnail size\n"
+            "  Ctrl / Shift + click  select several images\n\n"
+            "Full-size viewer\n"
+            "  Left / Right / Space  previous / next image\n"
+            "  Home / End            first / last image\n"
+            "  0 to 5, F             rate, favourite\n"
+            "  Esc                   close\n\n"
+            "Letters, digits and arrows are left alone while you are typing in a box or using a "
+            "dropdown or list, so click a thumbnail first to use the shortcuts."))
+        text.config(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=8)
+
     # ---------- restore points ----------
     def begin_point(self, label, kind="auto"):
         if not self.restore:
@@ -1398,6 +1710,7 @@ class App:
         self.end_point(rp, True)
         self.cache.clear()
         self.refresh()
+        self.start_details()  # an older snapshot may lack the newer width / height / size columns
         return done, problems
 
     def restore_dialog(self):
@@ -1476,7 +1789,7 @@ class App:
             if len(lb.curselection()) != 1:
                 messagebox.showinfo("Restore", "Select a single restore point to restore to.", parent=win)
                 return
-            if self.index_job:
+            if self.index_job or self.detail_job:
                 messagebox.showinfo("Restore", "Wait for the running import to finish first.", parent=win)
                 return
             ids, steps, problems = self.restore.revert_plan(p[0])
@@ -1970,6 +2283,8 @@ class App:
         reload()
 
     def on_close(self):
+        if self.detail_job:
+            self.detail_job[1].set()
         if self.index_job:
             self.index_job[1].set()
             if self.index_thread:

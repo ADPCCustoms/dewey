@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.14
+- Keyboard shortcuts (F1 lists them): arrows, Enter, Esc, Delete, 0-5 ratings, F favourite, F5, Ctrl+F, Ctrl+O, Ctrl+A, Page Up/Down
+- Detail filters: shape, width/height, file size, taken date, format
+- Image sizes stored on import and read in the background for existing images
+- Delete key moves images to the app trash with a restore point
+
 ## v1.13
 - Renamed to Dewey (window title, Dewey.exe, README). Library files are unchanged
 
