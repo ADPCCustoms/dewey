@@ -1,10 +1,10 @@
-# Image Library
+# Dewey
 
 <p align="center"><img src="icon.png" width="128" alt="App icon"></p>
 
-A small desktop app for organising a mixed collection of images: photos, art and AI-generated pictures. It builds an index of your images, lets you tag and search them, finds duplicates, and can sort them into folders you choose.
+Dewey is a small desktop app for organising a mixed collection of images (named after the library classification system): photos, art and AI-generated pictures. It builds an index of your images, lets you tag and search them, finds duplicates, and can sort them into folders you choose.
 
-Your original files are never changed. Nothing is moved or deleted unless you choose **Move** in the sort dialog.
+Dewey only changes your files when you ask it to (rename, move, delete duplicates), and each of those can be undone from **Restore points**. Importing, tagging, searching and copying never touch your originals.
 
 ## Features
 
@@ -74,7 +74,7 @@ Double-click `build.bat`, or run:
 
 ```
 pip install pyinstaller
-pyinstaller --onefile --windowed --name ImageLibrary image_library.py
+pyinstaller --onefile --windowed --name Dewey image_library.py
 ```
 
 The exe appears in the `dist` folder. To use a custom icon, put an `icon.ico` file next to `build.bat` before building.
@@ -92,7 +92,7 @@ It needs [Git](https://git-scm.com) and the [GitHub CLI](https://cli.github.com)
 The exe isn't code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**. To check a download is the file that was published, compare its checksum with the SHA256 in the release notes:
 
 ```
-Get-FileHash .\ImageLibrary.exe -Algorithm SHA256
+Get-FileHash .\Dewey.exe -Algorithm SHA256
 ```
 
 ## License

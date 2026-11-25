@@ -10,8 +10,8 @@ python -c "import tkinterdnd2" 2>nul && set DND=--collect-all tkinterdnd2
 set ICON=
 if exist icon.ico set ICON=--icon icon.ico --add-data "icon.ico;."
 
-echo Building ImageLibrary.exe...
-pyinstaller --onefile --windowed --name ImageLibrary %ICON% %DND% image_library.py
+echo Building Dewey.exe...
+pyinstaller --onefile --windowed --name Dewey %ICON% %DND% image_library.py
 
 echo.
 echo Done. Your exe is in the dist folder.

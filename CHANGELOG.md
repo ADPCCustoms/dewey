@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.13
+- Renamed to Dewey (window title, Dewey.exe, README). Library files are unchanged
+
 ## v1.12
 - New app icon (exe, window, taskbar, dialogs), drawn by make_icon.py
 

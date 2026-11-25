@@ -17,10 +17,10 @@ echo Publishing %VERSION% ...
 
 rem 1. Build first so nothing is pushed if the build fails
 call build.bat nopause
-if not exist dist\ImageLibrary.exe (echo Build failed. & pause & exit /b 1)
+if not exist dist\Dewey.exe (echo Build failed. & pause & exit /b 1)
 
 rem 2. Release notes = release-notes.md + SmartScreen note + checksum
-for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash dist\ImageLibrary.exe -Algorithm SHA256).Hash"') do set HASH=%%H
+for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash dist\Dewey.exe -Algorithm SHA256).Hash"') do set HASH=%%H
 copy /y release-notes.md dist\release-notes.md >nul
 >> dist\release-notes.md echo.
 >> dist\release-notes.md echo ---
@@ -42,7 +42,7 @@ if errorlevel 1 (
     set VIS=private
     set /p VIS=Make the new repo public or private? [private]: 
     if /i not "!VIS!"=="public" set VIS=private
-    gh repo create image-library --!VIS! --source=. --remote=origin --push
+    gh repo create dewey --!VIS! --source=. --remote=origin --push
     if errorlevel 1 (echo Could not create the repo. & pause & exit /b 1)
 ) else (
     git push -u origin main
@@ -50,7 +50,7 @@ if errorlevel 1 (
 )
 
 rem 4. Publish the release
-gh release create %VERSION% dist\ImageLibrary.exe --title "%VERSION%" --notes-file dist\release-notes.md
+gh release create %VERSION% dist\Dewey.exe --title "Dewey %VERSION%" --notes-file dist\release-notes.md
 if errorlevel 1 (echo Release failed. & pause & exit /b 1)
 
 echo.

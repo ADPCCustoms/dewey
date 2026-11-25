@@ -1,4 +1,4 @@
-"""Image Library - index, tag and search your images. Files are never moved or changed.
+"""Dewey - organise your images: index, tag, search, sort, find duplicates, restore points.
 Requires: pip install pillow
 """
 import gzip, hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
@@ -607,7 +607,7 @@ def file_info(p):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Image Library")
+        root.title("Dewey")
         root.geometry("1280x740")
         self.db = sqlite3.connect(DB_PATH, timeout=30)
         ensure_schema(self.db)
