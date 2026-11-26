@@ -17,7 +17,7 @@ Dewey only changes your files when you ask it to (rename, move, delete duplicate
 - **Detail filters**: the **Filters** button opens a bar to narrow what is showing by shape (landscape, portrait, square), minimum width and height, file size in MB, taken date (a year, month or full date) and format. They combine with search, the sidebar and albums.
 - **Keyboard shortcuts** (F1 shows the list): arrows to move, Enter to view, 0-5 to rate, F to favourite, Delete to move to the trash (undoable), F5, Ctrl+F, Ctrl+O, Ctrl+A, Page Up / Page Down. They step aside while you type in a box.
 - **Dark mode**: toggle in the top bar; your choice is remembered.
-- **Thumbnail size**: slider in the bottom bar (80 to 280 px) or Ctrl + mouse wheel over the grid; remembered between sessions.
+- **Thumbnail size**: slider in the bottom bar (80 to 280 px) or Ctrl + mouse wheel over the grid; remembered between sessions. The number of images per page follows it (160 at the smallest size down to 20 at the largest).
 - **Thumbnail grid** with a large preview, file details and embedded prompt (when the file has one).
 - **Search** by filename, prompt text or tag. Several words must all match.
 - **Filter by type**: photo, ai or other.
@@ -27,7 +27,7 @@ Dewey only changes your files when you ask it to (rename, move, delete duplicate
 - **Albums**: hand-picked collections shown in the sidebar. They are virtual, so no files are moved or copied, and an image can be in several albums. Use **Add to album** in the side panel, **Remove from album** while an album is open, and right-click an album to rename, reorder, delete it, or copy or move its images into a real folder. Deleting an album never touches the images.
 - **Favourites and ratings**: mark a favourite (gold border in the grid) and give 0 to 5 stars, for one or many selected images.
 - **Rename in bulk**: patterns such as `{date}_{n:03}` using `{date}`, `{type}`, `{tag}`, `{name}` and a counter, with a preview first.
-- **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter, 0-5 rates, F toggles favourite, Esc closes.
+- **Full-size viewer**: double-click a thumbnail (or press **View**). Left/Right arrows browse the current search or filter. Mouse wheel zooms around the pointer, drag pans, double-click (or Z) toggles fit and 100%. **Slideshow** (S) with an adjustable delay and optional shuffle, full screen with F11. 0-5 rates, F toggles favourite, Esc closes.
 - **Sort**: newest, oldest, name A-Z / Z-A, highest rated, favourites first.
 - **Find duplicates**: lists exact copies, grouped into sets.
 - **Find similar**: finds look-alike images (the same picture resized, re-saved at another quality, or with slightly different brightness). Pick a strictness, review each group side by side, tick the ones to keep (the largest is ticked by default) and the rest go to the app trash (undoable). It does not detect rotated, flipped or heavily cropped copies.

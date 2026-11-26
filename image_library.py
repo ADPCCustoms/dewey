@@ -1,7 +1,7 @@
 """Dewey - organise your images: index, tag, search, sort, find duplicates, restore points.
 Requires: pip install pillow
 """
-import gzip, hashlib, json, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
+import gzip, hashlib, json, math, os, queue, random, re, shutil, sqlite3, subprocess, sys, threading, time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
@@ -26,6 +26,7 @@ def resource_path(name):
 
 
 THUMB, PAGE = 140, 60
+PAGE_SIZES = {80: 160, 110: 100, 140: 60, 180: 40, 220: 28, 280: 20}  # images per page, by thumbnail size
 SIZES = [80, 110, 140, 180, 220, 280]  # thumbnail sizes offered by the slider
 WATCH_MS = 60_000  # how often watched folders are checked
 
@@ -196,6 +197,49 @@ def similar_worker(db_path, threshold, q, cancel):
         q.put(("done", False))
     except Exception as e:
         q.put(("error", str(e)))
+
+
+def fit_zoom(iw, ih, cw, ch):
+    """Zoom that fits the whole image in the viewport (never enlarges past 100%)."""
+    return min(cw / max(1, iw), ch / max(1, ih), 1.0)
+
+
+def clamp_center(cx, cy, iw, ih):
+    return min(max(cx, 0.0), float(iw)), min(max(cy, 0.0), float(ih))
+
+
+def zoom_at(cx, cy, z, new_z, mx, my, cw, ch):
+    """New view centre after zooming from z to new_z, keeping the image point under the cursor fixed."""
+    ix, iy = cx + (mx - cw / 2) / z, cy + (my - ch / 2) / z
+    return ix - (mx - cw / 2) / new_z, iy - (my - ch / 2) / new_z
+
+
+def view_box(cx, cy, z, cw, ch, iw, ih):
+    """The part of the image (integer box) visible in a cw x ch viewport centred on (cx, cy) at zoom z,
+    and where its top-left corner lands in the viewport."""
+    sw, sh = cw / z, ch / z
+    l, t = cx - sw / 2, cy - sh / 2
+    left, top = min(max(0, math.floor(l)), iw - 1), min(max(0, math.floor(t)), ih - 1)
+    right, bottom = max(min(iw, math.ceil(l + sw)), left + 1), max(min(ih, math.ceil(t + sh)), top + 1)
+    return (left, top, right, bottom), ((left - l) * z, (top - t) * z)
+
+
+def render_view(img, cx, cy, z, cw, ch, hq=True):
+    """Draw only what is visible, so panning and zooming cost the same on a 100-megapixel image as on a
+    small one. Returns (picture, x, y, cx, cy): where to put it and the (possibly adjusted) centre."""
+    iw, ih = img.size
+    if iw * z <= cw:
+        cx = iw / 2  # an image narrower than the window stays centred
+    if ih * z <= ch:
+        cy = ih / 2
+    box, (x0, y0) = view_box(cx, cy, z, cw, ch, iw, ih)
+    crop = img.crop(box)
+    size = (max(1, round(crop.width * z)), max(1, round(crop.height * z)))
+    if z < 0.5:  # shrink by a whole factor first: much faster for big images
+        f = int(1 / z)
+        if f > 1 and crop.width >= f and crop.height >= f:
+            crop = crop.reduce(f)
+    return crop.resize(size, Image.LANCZOS if hq else Image.BILINEAR), round(x0), round(y0), cx, cy
 
 
 def where_sql(spec):
@@ -929,7 +973,7 @@ class App:
         self.refresh()
 
     def change_page(self, delta):
-        last = max(0, (self.total - 1) // PAGE)
+        last = max(0, (self.total - 1) // self.page_size)
         self.page = min(max(0, self.page + delta), last)
         self.refresh()
 
@@ -938,8 +982,8 @@ class App:
         self.total = self.db.execute("SELECT COUNT(*) FROM images" + w, p).fetchone()[0]
         self.rows = self.db.execute(
             "SELECT id, path, fav FROM images" + w + SORTS[self.sort_var.get()] + " LIMIT ? OFFSET ?",
-            p + [PAGE, self.page * PAGE]).fetchall()
-        pages = max(1, (self.total + PAGE - 1) // PAGE)
+            p + [self.page_size, self.page * self.page_size]).fetchall()
+        pages = max(1, (self.total + self.page_size - 1) // self.page_size)
         self.page_label.config(text=f"Page {self.page + 1} of {pages}  ({self.total} images)")
         self.render()
         self.selected &= {r[0] for r in self.rows}
@@ -955,6 +999,11 @@ class App:
         if self.placeholder is None:
             self.placeholder = ImageTk.PhotoImage(Image.new("RGB", (self.thumb_size, self.thumb_size), "#cccccc"))
         return self.placeholder
+
+    @property
+    def page_size(self):
+        """Smaller thumbnails fit more on a page; bigger ones fewer."""
+        return PAGE_SIZES.get(getattr(self, "thumb_size", THUMB), PAGE)
 
     def on_size_drag(self, value):
         n = min(max(int(round(float(value))), 0), len(SIZES) - 1)
@@ -977,13 +1026,15 @@ class App:
     def set_thumb_size(self, size):
         if size == self.thumb_size:
             return
+        first = self.page * self.page_size  # index of the first image on screen, to stay near it
         self.thumb_size = size
         self.db.execute("INSERT OR REPLACE INTO settings VALUES('thumb_size', ?)", (str(size),))
         self.db.commit()
         self.cache.clear()
         self.placeholder = None
         self.cols = max(1, self.canvas.winfo_width() // (size + 16))
-        self.render()
+        self.page = first // self.page_size
+        self.refresh()  # a different number of images per page, so fetch the page again
 
     def start_thumbs(self):
         self.thumb_state["token"] += 1
@@ -2019,8 +2070,14 @@ class App:
             "  Ctrl + mouse wheel    thumbnail size\n"
             "  Ctrl / Shift + click  select several images\n\n"
             "Full-size viewer\n"
-            "  Left / Right / Space  previous / next image\n"
+            "  Left / Right / Space  previous / next image (Backspace: previous)\n"
             "  Home / End            first / last image\n"
+            "  Mouse wheel           zoom in and out around the pointer\n"
+            "  Drag                  pan when zoomed in\n"
+            "  Double-click, Z       toggle fit and 100%\n"
+            "  + / -                 zoom in / out\n"
+            "  S                     start / stop the slideshow ([ and ] change the delay)\n"
+            "  F11                   full screen (Esc leaves it)\n"
             "  0 to 5, F             rate, favourite\n"
             "  Esc                   close\n\n"
             "Letters, digits and arrows are left alone while you are typing in a box or using a "
@@ -2683,67 +2740,302 @@ class App:
             return
         idx = next((n for n, r in enumerate(items) if r[0] == start_id), 0)
         win = tk.Toplevel(self.root)
-        win.geometry("1000x760")
+        win.geometry("1100x800")
         win.configure(bg="black")
         win.no_theme = True
-        tk.Label(win, text="← → browse    0-5 rate    F favourite    Esc close",
-                 bg="black", fg="#888888").pack(side="bottom")
-        lbl = tk.Label(win, bg="black", fg="white")
-        lbl.pack(fill="both", expand=True)
-        st = {"i": idx, "img": None, "size": (0, 0), "job": None}
+        row = self.db.execute("SELECT value FROM settings WHERE key='slideshow_seconds'").fetchone()
+        secs = int(row[0]) if row and row[0].isdigit() and 1 <= int(row[0]) <= 60 else 4
+        interval, shuffle = tk.IntVar(value=secs), tk.BooleanVar(value=False)
+        bar = tk.Frame(win, bg="#141414")
+        bar.pack(side="bottom", fill="x")
+        canvas = tk.Canvas(win, bg="black", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        st = {"i": idx, "img": None, "z": 1.0, "cx": 0.0, "cy": 0.0, "fit": True, "photo": None,
+              "drag": None, "show": False, "full": False, "meta": (0, 0), "ready": False,
+              "closed": False, "job": None, "hq": None, "resize": None}
 
-        def show():
-            iid, path = items[st["i"]]
-            fav, rating = self.db.execute("SELECT fav, rating FROM images WHERE id=?",
-                                          (iid,)).fetchone()
+        def button(text, cmd, **kw):
+            b = tk.Button(bar, text=text, command=lambda: (cmd(), canvas.focus_set()), bg="#2b2b2b",
+                          fg="#dddddd", activebackground="#4a4a4a", activeforeground="#ffffff",
+                          relief="flat", bd=0, padx=8, pady=3, **kw)
+            b.pack(side="left", padx=(6, 0), pady=5)
+            return b
+
+        def label(text, **kw):
+            lb = tk.Label(bar, text=text, bg="#141414", fg="#aaaaaa", **kw)
+            lb.pack(side="left", padx=(8, 0))
+            return lb
+
+        def canvas_size():
+            return max(50, canvas.winfo_width()), max(50, canvas.winfo_height())
+
+        def refresh_meta():
+            iid = items[st["i"]][0]
+            st["meta"] = self.db.execute("SELECT fav, rating FROM images WHERE id=?", (iid,)).fetchone()
+
+        def update_title():
+            fav, rating = st["meta"]
+            zoom = f"{round(st['z'] * 100)}%" if st["img"] is not None else ""
+            zoom_lbl.config(text=zoom)
+            win.title(f"{Path(items[st['i']][1]).name}    {st['i'] + 1} / {len(items)}    {zoom}    "
+                      f"{'▶ ' if st['show'] else ''}{'♥ ' if fav else ''}{'★' * (rating or 0)}")
+
+        def render(hq=True):
+            if st["closed"]:
+                return
+            canvas.delete("all")
+            img, (cw, ch) = st["img"], canvas_size()
+            if img is None:
+                canvas.create_text(cw / 2, ch / 2, text="(file missing)", fill="white")
+                update_title()
+                return
+            if st["fit"]:
+                st["z"] = fit_zoom(img.width, img.height, cw, ch)
+                st["cx"], st["cy"] = img.width / 2, img.height / 2
+            crop, x0, y0, st["cx"], st["cy"] = render_view(img, st["cx"], st["cy"], st["z"], cw, ch, hq)
+            st["photo"] = ImageTk.PhotoImage(crop)
+            canvas.create_image(x0, y0, anchor="nw", image=st["photo"])
+            update_title()
+
+        def later_sharp():  # quick preview while moving, full quality shortly after you stop
+            if st["hq"]:
+                win.after_cancel(st["hq"])
+            st["hq"] = win.after(200, lambda: render(True))
+
+        def load():
             try:
-                img = Image.open(path).convert("RGB")
-                img.thumbnail((max(200, win.winfo_width() - 4), max(200, win.winfo_height() - 30)))
-                st["img"] = ImageTk.PhotoImage(img)
-                lbl.config(image=st["img"], text="")
+                with Image.open(items[st["i"]][1]) as im:
+                    st["img"] = im.convert("RGB")
             except Exception:
-                lbl.config(image="", text="(file missing)")
-            win.title(f"{Path(path).name}    {st['i'] + 1} / {len(items)}    "
-                      f"{'♥ ' if fav else ''}{'★' * (rating or 0)}")
+                st["img"] = None
+            st["fit"] = True
+            refresh_meta()
+            render()
+
+        # ---- zoom and pan
+        def zoom_by(factor, mx=None, my=None):
+            img = st["img"]
+            if img is None:
+                return
+            cw, ch = canvas_size()
+            mx, my = (cw / 2 if mx is None else mx), (ch / 2 if my is None else my)
+            z = st["z"]
+            nz = min(max(z * factor, 0.02), 16.0)
+            if nz == z:
+                return
+            st["cx"], st["cy"] = clamp_center(*zoom_at(st["cx"], st["cy"], z, nz, mx, my, cw, ch),
+                                              img.width, img.height)
+            st["z"], st["fit"] = nz, False
+            render(False)
+            later_sharp()
+
+        def on_wheel(e):
+            up = e.delta > 0 if e.delta else e.num == 4
+            zoom_by(1.2 if up else 1 / 1.2, e.x, e.y)
+
+        def fit():
+            st["fit"] = True
+            render()
+
+        def actual(e=None):  # 100%; a double-click zooms in on the spot you clicked
+            img = st["img"]
+            if img is None:
+                return
+            if e is not None and st["fit"] and abs(st["z"] - 1.0) > 1e-6:
+                cw, ch = canvas_size()
+                st["cx"], st["cy"] = clamp_center(*zoom_at(st["cx"], st["cy"], st["z"], 1.0, e.x, e.y, cw, ch),
+                                                  img.width, img.height)
+            elif e is not None and not st["fit"]:
+                fit()
+                return
+            st["z"], st["fit"] = 1.0, False
+            render()
+
+        def drag_start(e):
+            st["drag"] = (e.x, e.y, st["cx"], st["cy"])
+
+        def drag_move(e):
+            img = st["img"]
+            if not st["drag"] or img is None:
+                return
+            cw, ch = canvas_size()
+            if st["fit"] and img.width * st["z"] <= cw and img.height * st["z"] <= ch:
+                return  # whole image already visible, nothing to pan
+            x0, y0, cx0, cy0 = st["drag"]
+            st["cx"], st["cy"] = clamp_center(cx0 - (e.x - x0) / st["z"], cy0 - (e.y - y0) / st["z"],
+                                              img.width, img.height)
+            st["fit"] = False
+            render(False)
+            later_sharp()
+
+        # ---- moving between images and the slideshow
+        def schedule_show():
+            if st["job"]:
+                win.after_cancel(st["job"])
+                st["job"] = None
+            if st["show"] and not st["closed"]:
+                try:
+                    delay = max(1, int(interval.get()))
+                except (tk.TclError, ValueError):  # half-typed text in the box
+                    delay = secs
+                st["job"] = win.after(delay * 1000, advance)
+
+        def advance():
+            st["job"] = None
+            if not st["show"] or st["closed"]:
+                return
+            n = len(items)
+            if shuffle.get() and n > 1:
+                j = st["i"]
+                while j == st["i"]:
+                    j = random.randrange(n)
+            else:
+                j = (st["i"] + 1) % n  # the slideshow loops
+            st["i"] = j
+            load()
+            schedule_show()
+
+        def toggle_show():
+            st["show"] = not st["show"]
+            show_btn.config(text="⏸ Pause" if st["show"] else "▶ Slideshow")
+            schedule_show()
+            update_title()
+
+        def set_interval(v=None):
+            try:
+                v = int(interval.get() if v is None else v)
+            except (tk.TclError, ValueError):
+                v = secs
+            v = min(max(v, 1), 60)
+            interval.set(v)
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('slideshow_seconds', ?)", (str(v),))
+            self.db.commit()
+            schedule_show()
 
         def go(delta=None, to=None):
             n = st["i"] + delta if delta is not None else to
-            st["i"] = min(max(n, 0), len(items) - 1)
-            show()
+            n = min(max(n, 0), len(items) - 1)
+            if n != st["i"]:
+                st["i"] = n
+                load()
+                schedule_show()  # restart the countdown after a manual move
 
-        def on_key(e):
-            iid = items[st["i"]][0]
-            if e.char and e.char in "012345":
-                self.db.execute("UPDATE images SET rating=? WHERE id=?", (int(e.char), iid))
-            elif e.char and e.char.lower() == "f":
-                self.db.execute("UPDATE images SET fav=1-fav WHERE id=?", (iid,))
-            else:
-                return
-            self.db.commit()
-            show()
+        def toggle_full():
+            st["full"] = not st["full"]
+            win.attributes("-fullscreen", st["full"])
 
         def close():
+            st["closed"] = True
+            for k in ("job", "hq", "resize"):
+                if st[k]:
+                    try:
+                        win.after_cancel(st[k])
+                    except tk.TclError:
+                        pass
             win.destroy()
             self.refresh()
 
-        def on_resize(e):
-            if e.widget is win and (e.width, e.height) != st["size"]:
-                st["size"] = (e.width, e.height)
-                if st["job"]:
-                    win.after_cancel(st["job"])
-                st["job"] = win.after(150, show)
+        def escape(e=None):
+            if st["full"]:
+                toggle_full()
+            else:
+                close()
 
-        win.bind("<Right>", lambda e: go(1))
-        win.bind("<space>", lambda e: go(1))
-        win.bind("<Left>", lambda e: go(-1))
-        win.bind("<Home>", lambda e: go(to=0))
-        win.bind("<End>", lambda e: go(to=len(items) - 1))
-        win.bind("<Escape>", lambda e: close())
+        def on_key(e):
+            if e.widget.winfo_class() in ("Spinbox", "Entry"):
+                return
+            c = e.char
+            iid = items[st["i"]][0]
+            if c and c in "012345":
+                self.db.execute("UPDATE images SET rating=? WHERE id=?", (int(c), iid))
+            elif c.lower() == "f":
+                self.db.execute("UPDATE images SET fav=1-fav WHERE id=?", (iid,))
+            elif c in ("+", "="):
+                zoom_by(1.25)
+                return
+            elif c in ("-", "_"):
+                zoom_by(1 / 1.25)
+                return
+            elif c.lower() == "z":
+                fit() if not st["fit"] else actual()
+                return
+            elif c.lower() == "s":
+                toggle_show()
+                return
+            elif c == "[":
+                set_interval(interval.get() - 1)
+                return
+            elif c == "]":
+                set_interval(interval.get() + 1)
+                return
+            else:
+                return
+            self.db.commit()
+            refresh_meta()
+            update_title()
+
+        def on_resize(e):
+            if not st["ready"]:
+                return
+            if st["resize"]:
+                win.after_cancel(st["resize"])
+            st["resize"] = win.after(120, render)
+
+        # ---- the control bar
+        button("◀ Prev", lambda: go(-1))
+        button("Next ▶", lambda: go(1))
+        label("|")
+        button("Fit", fit)
+        button("100%", actual)
+        button("−", lambda: zoom_by(1 / 1.25))
+        button("+", lambda: zoom_by(1.25))
+        zoom_lbl = label("", width=6)
+        label("|")
+        show_btn = button("▶ Slideshow", toggle_show)
+        label("every")
+        spin = tk.Spinbox(bar, from_=1, to=60, width=3, textvariable=interval, command=set_interval,
+                          bg="#2b2b2b", fg="#dddddd", buttonbackground="#2b2b2b", relief="flat",
+                          insertbackground="#dddddd")
+        spin.pack(side="left", padx=(6, 0))
+        spin.bind("<Return>", lambda e: (set_interval(), canvas.focus_set()))
+        spin.bind("<FocusOut>", lambda e: set_interval())
+        label("s")
+        tk.Checkbutton(bar, text="Shuffle", variable=shuffle, bg="#141414", fg="#aaaaaa",
+                       selectcolor="#2b2b2b", activebackground="#141414", activeforeground="#ffffff",
+                       highlightthickness=0, bd=0).pack(side="left", padx=(8, 0))
+        button("⛶ Full screen", toggle_full)
+        tk.Label(bar, text="wheel zoom · drag pan · double-click 100% · S slideshow · F11 full screen",
+                 bg="#141414", fg="#666666").pack(side="right", padx=8)
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        canvas.bind("<Button-4>", on_wheel)
+        canvas.bind("<Button-5>", on_wheel)
+        canvas.bind("<ButtonPress-1>", drag_start)
+        canvas.bind("<B1-Motion>", drag_move)
+        canvas.bind("<Double-Button-1>", actual)
+        canvas.bind("<Configure>", on_resize)
+
+        def nav(fn):
+            return lambda e: None if e.widget.winfo_class() in ("Spinbox", "Entry") else fn()
+
+        win.bind("<Right>", nav(lambda: go(1)))
+        win.bind("<space>", nav(lambda: go(1)))
+        win.bind("<Left>", nav(lambda: go(-1)))
+        win.bind("<BackSpace>", nav(lambda: go(-1)))
+        win.bind("<Home>", nav(lambda: go(to=0)))
+        win.bind("<End>", nav(lambda: go(to=len(items) - 1)))
+        win.bind("<F11>", lambda e: toggle_full())
+        win.bind("<Escape>", escape)
         win.bind("<Key>", on_key)
-        win.bind("<Configure>", on_resize)
         win.protocol("WM_DELETE_WINDOW", close)
         win.focus_force()
-        win.after(100, show)
+
+        def start():
+            st["ready"] = True
+            load()
+            canvas.focus_set()
+
+        win.after(80, start)
 
     # ---------- housekeeping ----------
     def missing_ids(self):

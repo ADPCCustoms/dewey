@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.16
+- Viewer: mouse-wheel zoom, drag to pan, fit / 100% toggle, control bar
+- Viewer: slideshow with adjustable delay (remembered), shuffle, looping; full screen with F11
+- Viewer draws only the visible area, so large images stay smooth
+- Images per page follow the thumbnail size (160 to 20), keeping your place when it changes
+
 ## v1.15
 - Smart albums: save any view (search, sidebar view, type, detail filters) and it stays up to date
 - Tag manager: rename, merge and delete tags library-wide, with restore points for large changes
