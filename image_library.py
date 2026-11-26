@@ -1,7 +1,7 @@
 """Dewey - organise your images: index, tag, search, sort, find duplicates, restore points.
 Requires: pip install pillow
 """
-import gzip, hashlib, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
+import gzip, hashlib, json, os, queue, re, shutil, sqlite3, subprocess, sys, threading, time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS tags(
 CREATE TABLE IF NOT EXISTS watch(folder TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS albums(
   id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, pos INTEGER);
+CREATE TABLE IF NOT EXISTS smart(
+  id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, pos INTEGER, spec TEXT);
 CREATE TABLE IF NOT EXISTS album_images(
   album_id INTEGER, image_id INTEGER, UNIQUE(album_id, image_id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
@@ -194,6 +196,67 @@ def similar_worker(db_path, threshold, q, cancel):
         q.put(("done", False))
     except Exception as e:
         q.put(("error", str(e)))
+
+
+def where_sql(spec):
+    """SQL for a view described by spec = {side, search, kind, filters}. Pure, so saved views
+    (smart albums) can be counted and applied without touching the window."""
+    sql, params = " WHERE 1=1", []
+    mode, val = (list(spec.get("side") or ["all", None]) + [None, None])[:2]
+    if mode == "fav":
+        sql += " AND fav=1"
+    elif mode == "rated":
+        sql += " AND rating>=4"
+    elif mode == "untagged":
+        sql += " AND id NOT IN (SELECT image_id FROM tags)"
+    elif mode == "tag":
+        sql += " AND id IN (SELECT image_id FROM tags WHERE tag=?)"
+        params.append(val)
+    elif mode == "album":
+        sql += " AND id IN (SELECT image_id FROM album_images WHERE album_id=?)"
+        params.append(val)
+    fv = spec.get("filters") or {}
+    if fv:  # detail filters: shape, size in pixels, file size, taken date, format
+        def num(key):
+            try:
+                v = float(str(fv.get(key, "")).strip().replace(",", "."))
+            except ValueError:
+                return None
+            return None if v != v or abs(v) == float("inf") else v  # ignore nan / inf typed by mistake
+        o = fv.get("orient", "Any")
+        if o == "Landscape":
+            sql += " AND width > height"
+        elif o == "Portrait":
+            sql += " AND height > width"
+        elif o == "Square":
+            sql += " AND width = height AND width > 0"
+        for key, col, op, scale in (("minw", "width", ">=", 1), ("minh", "height", ">=", 1),
+                                    ("minmb", "filesize", ">=", 1048576),
+                                    ("maxmb", "filesize", "<=", 1048576)):
+            v = num(key)
+            if v is not None:
+                sql += f" AND {col} {op} ?"
+                params.append(int(v * scale))
+        for key, op in (("dfrom", ">="), ("dto", "<=")):
+            d = str(fv.get(key, "")).strip()
+            if re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", d):  # 2026, 2026-11 or 2026-11-25
+                sql += f" AND substr(taken, 1, {len(d)}) {op} ?"
+                params.append(d)
+        f = fv.get("fmt", "Any")
+        if f == "JPG":
+            sql += " AND (lower(path) LIKE '%.jpg' OR lower(path) LIKE '%.jpeg')"
+        elif f != "Any":
+            sql += " AND lower(path) LIKE ?"
+            params.append("%." + f.lower())
+    if spec.get("kind", "all") != "all":
+        sql += " AND kind=?"
+        params.append(spec["kind"])
+    for w in (spec.get("search") or "").split():
+        like = f"%{w}%"
+        sql += (" AND (path LIKE ? OR IFNULL(prompt,'') LIKE ?"
+                " OR id IN (SELECT image_id FROM tags WHERE tag LIKE ?))")
+        params += [like, like, like]
+    return sql, params
 
 
 RESTORE_DIR = BASE / "restore"
@@ -664,6 +727,7 @@ class App:
         self.thumb_state, self.thumb_q, self.thumb_left = {"token": 0}, queue.Queue(), set()
         self.index_job, self.index_thread = None, None
         self.detail_job = None
+        self.active_smart = None
         self.default_theme = ttk.Style().theme_use()
         row = self.db.execute("SELECT value FROM settings WHERE key='theme'").fetchone()
         self.theme = row[0] if row and row[0] in THEMES else "light"
@@ -782,6 +846,10 @@ class App:
         self.album_btn.config(menu=self.album_menu)
         self.album_btn.pack(side="left")
         ttk.Button(arow, text="Remove from album", command=self.remove_from_album).pack(side="left", padx=4)
+        mrow = ttk.Frame(d)
+        mrow.pack(fill="x", pady=(0, 4))
+        ttk.Button(mrow, text="Manage tags…", command=self.tag_dialog).pack(side="left")
+        ttk.Button(mrow, text="Save view…", command=self.save_smart).pack(side="left", padx=4)
         row = ttk.Frame(d)
         row.pack(fill="x")
         ttk.Button(row, text="View", command=lambda: self.open_viewer(self.primary)).pack(side="left")
@@ -844,64 +912,19 @@ class App:
         self.debounce = self.root.after(300, self.reset_page)
 
     # ---------- data ----------
-    def where(self):
-        sql, params = " WHERE 1=1", []
-        mode, val = self.side_filter
-        if mode == "fav":
-            sql += " AND fav=1"
-        elif mode == "rated":
-            sql += " AND rating>=4"
-        elif mode == "untagged":
-            sql += " AND id NOT IN (SELECT image_id FROM tags)"
-        elif mode == "tag":
-            sql += " AND id IN (SELECT image_id FROM tags WHERE tag=?)"
-            params.append(val)
-        elif mode == "album":
-            sql += " AND id IN (SELECT image_id FROM album_images WHERE album_id=?)"
-            params.append(val)
+    def current_spec(self):
         fv = getattr(self, "fvars", None)
-        if fv:  # detail filters: shape, size in pixels, file size, taken date, format
-            def num(key):
-                try:
-                    return float(fv[key].get().strip().replace(",", "."))
-                except ValueError:
-                    return None
-            o = fv["orient"].get()
-            if o == "Landscape":
-                sql += " AND width > height"
-            elif o == "Portrait":
-                sql += " AND height > width"
-            elif o == "Square":
-                sql += " AND width = height AND width > 0"
-            for key, col, op, scale in (("minw", "width", ">=", 1), ("minh", "height", ">=", 1),
-                                        ("minmb", "filesize", ">=", 1048576),
-                                        ("maxmb", "filesize", "<=", 1048576)):
-                v = num(key)
-                if v is not None:
-                    sql += f" AND {col} {op} ?"
-                    params.append(int(v * scale))
-            for key, op in (("dfrom", ">="), ("dto", "<=")):
-                d = fv[key].get().strip()
-                if re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", d):  # 2026, 2026-11 or 2026-11-25
-                    sql += f" AND substr(taken, 1, {len(d)}) {op} ?"
-                    params.append(d)
-            f = fv["fmt"].get()
-            if f == "JPG":
-                sql += " AND (lower(path) LIKE '%.jpg' OR lower(path) LIKE '%.jpeg')"
-            elif f != "Any":
-                sql += " AND lower(path) LIKE ?"
-                params.append("%." + f.lower())
-        if self.kind_var.get() != "all":
-            sql += " AND kind=?"
-            params.append(self.kind_var.get())
-        for w in self.search_var.get().split():
-            like = f"%{w}%"
-            sql += (" AND (path LIKE ? OR IFNULL(prompt,'') LIKE ?"
-                    " OR id IN (SELECT image_id FROM tags WHERE tag LIKE ?))")
-            params += [like, like, like]
-        return sql, params
+        sort_var = getattr(self, "sort_var", None)
+        return {"side": list(self.side_filter), "search": self.search_var.get().strip(),
+                "kind": self.kind_var.get(),
+                "filters": {k: v.get() for k, v in fv.items()} if fv else {},
+                "sort": sort_var.get() if sort_var else "Newest first"}
+
+    def where(self):
+        return where_sql(self.current_spec())
 
     def reset_page(self):
+        self.active_smart = None  # any change of view leaves a smart album
         self.page = 0
         self.refresh()
 
@@ -1036,15 +1059,28 @@ class App:
                 "SELECT a.id, a.name, COUNT(ai.image_id) FROM albums a "
                 "LEFT JOIN album_images ai ON ai.album_id=a.id GROUP BY a.id ORDER BY a.pos, a.name"):
             items.append((f"▣ {name}", ("album", aid), n))
+        for sid, name, spec in self.db.execute(
+                "SELECT id, name, spec FROM smart ORDER BY pos, name").fetchall():
+            try:
+                w, p = where_sql(json.loads(spec))
+                n = self.db.execute("SELECT COUNT(*) FROM images" + w, p).fetchone()[0]
+            except Exception:
+                n = 0
+            items.append((f"◆ {name}", ("smart", sid), n))
         for tag, n in self.db.execute("SELECT tag, COUNT(*) FROM tags GROUP BY tag ORDER BY tag"):
             items.append((f"# {tag}", ("tag", tag), n))
         self.side_items = items
         self.side_list.delete(0, "end")
-        chosen = None
+        active = getattr(self, "active_smart", None)
+        chosen = chosen_smart = None
         for n, (label, key, cnt) in enumerate(items):
             self.side_list.insert("end", f"{label}  ({cnt})")
             if key == self.side_filter:
                 chosen = n
+            if active is not None and key == ("smart", active):
+                chosen_smart = n
+        if chosen_smart is not None:
+            chosen = chosen_smart
         if chosen is None:
             self.side_filter, chosen = ("all", None), 0
         self.side_list.selection_set(chosen)
@@ -1052,8 +1088,12 @@ class App:
     def on_side_select(self, event=None):
         sel = self.side_list.curselection()
         if sel:
-            self.side_filter = self.side_items[sel[0]][1]
-            self.reset_page()
+            key = self.side_items[sel[0]][1]
+            if key[0] == "smart":
+                self.apply_smart(key[1])
+            else:
+                self.side_filter = key
+                self.reset_page()
 
     # ---------- selection ----------
     def on_click(self, event, iid):
@@ -1311,6 +1351,302 @@ class App:
             else:
                 self.refresh_sidebar()
 
+    # ---------- smart albums: saved searches that stay up to date ----------
+    def spec_is_default(self, spec):
+        f = spec.get("filters") or {}
+        return (list(spec.get("side") or ["all", None]) == ["all", None] and not spec.get("search")
+                and spec.get("kind", "all") == "all"
+                and all(f.get(k, d) == d for k, d in self.FILTER_DEFAULTS.items()))
+
+    def describe_spec(self, spec):
+        parts = []
+        mode, val = (list(spec.get("side") or ["all", None]) + [None, None])[:2]
+        names = {"fav": "Favourites", "rated": "Rated 4+", "untagged": "Untagged"}
+        if mode in names:
+            parts.append(names[mode])
+        elif mode == "tag":
+            parts.append(f"tag '{val}'")
+        elif mode == "album":
+            row = self.db.execute("SELECT name FROM albums WHERE id=?", (val,)).fetchone()
+            parts.append(f"album '{row[0] if row else '(deleted)'}'")
+        if spec.get("search"):
+            parts.append(f"search '{spec['search']}'")
+        if spec.get("kind", "all") != "all":
+            parts.append(f"type {spec['kind']}")
+        f = spec.get("filters") or {}
+        if f.get("orient", "Any") != "Any":
+            parts.append(f["orient"].lower())
+        for key, text in (("minw", "width ≥ {} px"), ("minh", "height ≥ {} px"),
+                          ("minmb", "size ≥ {} MB"), ("maxmb", "size ≤ {} MB"),
+                          ("dfrom", "taken from {}"), ("dto", "taken to {}")):
+            if str(f.get(key, "")).strip():
+                parts.append(text.format(str(f[key]).strip()))
+        if f.get("fmt", "Any") != "Any":
+            parts.append(f"format {f['fmt']}")
+        return " · ".join(parts) or "everything"
+
+    def apply_spec(self, spec):
+        self.side_filter = tuple((list(spec.get("side") or ["all", None]) + [None, None])[:2])
+        self.search_var.set(spec.get("search", ""))
+        self.kind_var.set(spec.get("kind", "all"))
+        f = spec.get("filters") or {}
+        for k, d in self.FILTER_DEFAULTS.items():
+            self.fvars[k].set(f.get(k, d))
+        if spec.get("sort") in SORTS:
+            self.sort_var.set(spec["sort"])
+        n = self.active_filters()
+        self.filter_btn.config(text=f"Filters ({n}) ▾" if n else "Filters ▾")
+        if n and not self.filters_open:
+            self.toggle_filters()  # show the filters this view uses
+
+    def save_smart(self):
+        spec = self.current_spec()
+        if self.spec_is_default(spec):
+            messagebox.showinfo("Smart album", "The current view shows everything. Search, filter or "
+                                "pick a view in the sidebar first, then save it.")
+            return
+        name = simpledialog.askstring(
+            "Save as smart album",
+            f"Saves this view and keeps it up to date as images change:\n{self.describe_spec(spec)}\n\nName:",
+            parent=self.root)
+        if not name or not name.strip():
+            return
+        try:
+            pos = self.db.execute("SELECT COALESCE(MAX(pos), 0) + 1 FROM smart").fetchone()[0]
+            cur = self.db.execute("INSERT INTO smart(name, pos, spec) VALUES(?,?,?)",
+                                  (name.strip(), pos, json.dumps(spec)))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showinfo("Smart album", f"A smart album called '{name.strip()}' already exists.")
+            return
+        self.active_smart = cur.lastrowid
+        self.status.config(text=f"Saved smart album '{name.strip()}'")
+        self.refresh_sidebar()
+
+    def apply_smart(self, sid):
+        row = self.db.execute("SELECT spec FROM smart WHERE id=?", (sid,)).fetchone()
+        if not row:
+            return
+        self.apply_spec(json.loads(row[0]))
+        self.reset_page()
+        self.active_smart = sid
+        self.refresh_sidebar()
+
+    def describe_smart(self, sid):
+        name, spec = self.db.execute("SELECT name, spec FROM smart WHERE id=?", (sid,)).fetchone()
+        messagebox.showinfo(name, f"Matches: {self.describe_spec(json.loads(spec))}\n\n"
+                            "It updates itself as images are added, tagged or changed.")
+
+    def replace_smart(self, sid):
+        spec = self.current_spec()
+        if self.spec_is_default(spec):
+            messagebox.showinfo("Smart album", "The current view shows everything, so there is nothing to save.")
+            return
+        self.db.execute("UPDATE smart SET spec=? WHERE id=?", (json.dumps(spec), sid))
+        self.db.commit()
+        self.active_smart = sid
+        self.status.config(text="Smart album updated to the current view")
+        self.refresh_sidebar()
+
+    def rename_smart(self, sid):
+        old = self.db.execute("SELECT name FROM smart WHERE id=?", (sid,)).fetchone()[0]
+        name = simpledialog.askstring("Rename smart album", "New name:", initialvalue=old, parent=self.root)
+        if not name or not name.strip() or name.strip() == old:
+            return
+        try:
+            self.db.execute("UPDATE smart SET name=? WHERE id=?", (name.strip(), sid))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showinfo("Rename", f"A smart album called '{name.strip()}' already exists.")
+            return
+        self.refresh_sidebar()
+
+    def move_smart(self, sid, delta):
+        ids = [r[0] for r in self.db.execute("SELECT id FROM smart ORDER BY pos, name")]
+        i = ids.index(sid)
+        j = i + delta
+        if not 0 <= j < len(ids):
+            return
+        ids[i], ids[j] = ids[j], ids[i]
+        self.db.executemany("UPDATE smart SET pos=? WHERE id=?", [(n, a) for n, a in enumerate(ids, 1)])
+        self.db.commit()
+        self.refresh_sidebar()
+
+    def delete_smart(self, sid):
+        name = self.db.execute("SELECT name FROM smart WHERE id=?", (sid,)).fetchone()[0]
+        if not messagebox.askyesno("Delete smart album",
+                                   f"Delete the smart album '{name}'?\n\nNo images are affected."):
+            return
+        self.db.execute("DELETE FROM smart WHERE id=?", (sid,))
+        self.db.commit()
+        if getattr(self, "active_smart", None) == sid:
+            self.active_smart = None
+        self.refresh_sidebar()
+
+    # ---------- tag manager ----------
+    def tag_counts(self):
+        return self.db.execute("SELECT tag, COUNT(*) FROM tags GROUP BY tag ORDER BY tag").fetchall()
+
+    def retarget_smart(self, old_tags, new_tag):
+        """Smart albums and the current view that point at a renamed or merged tag follow it. When a tag is
+        deleted the current view resets, but a smart album keeps its tag and simply matches nothing."""
+        for sid, spec in self.db.execute("SELECT id, spec FROM smart").fetchall():
+            d = json.loads(spec)
+            side = d.get("side") or ["all", None]
+            if new_tag and side[0] == "tag" and side[1] in old_tags:  # a deleted tag leaves it matching nothing
+                d["side"] = ["tag", new_tag]
+                self.db.execute("UPDATE smart SET spec=? WHERE id=?", (json.dumps(d), sid))
+        if self.side_filter[0] == "tag" and self.side_filter[1] in old_tags:
+            self.side_filter = ("tag", new_tag) if new_tag else ("all", None)
+
+    def merge_tags(self, sources, target):
+        """Move every image from the source tags onto the target tag (a plain rename when the
+        target is new). Returns the number of images affected."""
+        target = (target or "").strip().lower()
+        sources = [t for t in dict.fromkeys(sources) if t != target]
+        if not target or not sources:
+            return 0
+        marks = ",".join("?" * len(sources))
+        n = self.db.execute(f"SELECT COUNT(DISTINCT image_id) FROM tags WHERE tag IN ({marks})",
+                            sources).fetchone()[0]
+        if n >= BULK_MIN:
+            self.end_point(self.begin_point(f"Merge {len(sources)} tag(s) into '{target}'"), True)
+        for t in sources:
+            self.db.execute("INSERT OR IGNORE INTO tags SELECT image_id, ? FROM tags WHERE tag=?", (target, t))
+            self.db.execute("DELETE FROM tags WHERE tag=?", (t,))
+        self.retarget_smart(sources, target)
+        self.db.commit()
+        return n
+
+    def delete_tags(self, tags):
+        tags = list(dict.fromkeys(tags))
+        if not tags:
+            return 0
+        marks = ",".join("?" * len(tags))
+        n = self.db.execute(f"SELECT COUNT(DISTINCT image_id) FROM tags WHERE tag IN ({marks})",
+                            tags).fetchone()[0]
+        if n >= BULK_MIN:
+            self.end_point(self.begin_point(f"Delete {len(tags)} tag(s)"), True)
+        self.db.execute(f"DELETE FROM tags WHERE tag IN ({marks})", tags)
+        self.retarget_smart(tags, None)
+        self.db.commit()
+        return n
+
+    def quick_rename_tag(self, tag):
+        new = simpledialog.askstring(
+            "Rename tag", f"New name for '{tag}'\n(use another tag's name to merge them):",
+            initialvalue=tag, parent=self.root)
+        if new and new.strip() and new.strip().lower() != tag:
+            self.merge_tags([tag], new)
+            self.refresh()
+
+    def quick_delete_tag(self, tag):
+        n = self.db.execute("SELECT COUNT(*) FROM tags WHERE tag=?", (tag,)).fetchone()[0]
+        if messagebox.askyesno("Delete tag", f"Remove the tag '{tag}' from {n} image(s)?\n\n"
+                               "The images themselves are not touched."):
+            self.delete_tags([tag])
+            self.refresh()
+
+    def tag_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Tag manager")
+        win.geometry("560x580")
+        win.transient(self.root)
+        win.grab_set()
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=12, pady=10)
+        ttk.Label(top, text="Filter:").pack(side="left")
+        fvar = tk.StringVar()
+        fe = ttk.Entry(top, textvariable=fvar)
+        fe.pack(side="left", fill="x", expand=True, padx=6)
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12)
+        tree = ttk.Treeview(body, columns=("tag", "n"), show="headings", selectmode="extended")
+        sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.column("tag", width=360)
+        tree.column("n", width=90, anchor="e")
+        sb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        status = ttk.Label(win, text="")
+        status.pack(anchor="w", padx=12, pady=4)
+        st = {"sort": ("tag", False), "rows": []}
+
+        def reload(event=None):
+            needle = fvar.get().strip().lower()
+            rows = [r for r in self.tag_counts() if needle in r[0]]
+            key, desc = st["sort"]
+            rows.sort(key=(lambda r: r[0]) if key == "tag" else (lambda r: (r[1], r[0])), reverse=desc)
+            st["rows"] = rows
+            tree.delete(*tree.get_children())
+            for i, (tag, n) in enumerate(rows):
+                tree.insert("", "end", iid=str(i), values=(tag, n))
+            total = sum(n for _, n in self.tag_counts())
+            status.config(text=f"{len(rows)} tags shown · {total} tag assignments in the library")
+
+        def sort_by(key):
+            st["sort"] = (key, not st["sort"][1] if st["sort"][0] == key else (key == "n"))
+            reload()
+
+        tree.heading("tag", text="Tag", command=lambda: sort_by("tag"))
+        tree.heading("n", text="Images", command=lambda: sort_by("n"))
+
+        def chosen():
+            return [st["rows"][int(i)][0] for i in tree.selection()]
+
+        def changed(message):
+            self.refresh()
+            reload()
+            status.config(text=message)
+
+        def rename():
+            sel = chosen()
+            if len(sel) != 1:
+                messagebox.showinfo("Rename", "Select exactly one tag to rename.", parent=win)
+                return
+            new = simpledialog.askstring("Rename tag", f"New name for '{sel[0]}'\n(use another tag's "
+                                         "name to merge them):", initialvalue=sel[0], parent=win)
+            if new and new.strip() and new.strip().lower() != sel[0]:
+                n = self.merge_tags(sel, new)
+                changed(f"Renamed '{sel[0]}' to '{new.strip().lower()}' on {n} image(s)")
+
+        def merge():
+            sel = chosen()
+            if len(sel) < 2:
+                messagebox.showinfo("Merge", "Select two or more tags to merge (Ctrl or Shift + click).",
+                                    parent=win)
+                return
+            counts = dict(self.tag_counts())
+            default = max(sel, key=lambda t: counts.get(t, 0))
+            target = simpledialog.askstring(
+                "Merge tags", f"Merge {len(sel)} tags into one tag. Name of the result:\n"
+                f"({', '.join(sel[:6])}{'…' if len(sel) > 6 else ''})", initialvalue=default, parent=win)
+            if target and target.strip():
+                n = self.merge_tags(sel, target)
+                changed(f"Merged {len(sel)} tags into '{target.strip().lower()}' ({n} image(s))")
+
+        def delete():
+            sel = chosen()
+            if not sel:
+                messagebox.showinfo("Delete", "Select one or more tags first.", parent=win)
+                return
+            if not messagebox.askyesno("Delete tags", f"Remove {len(sel)} tag(s) from every image?\n\n"
+                                       "The images themselves are not touched. Large changes get a "
+                                       "restore point.", parent=win):
+                return
+            n = self.delete_tags(sel)
+            changed(f"Deleted {len(sel)} tag(s) from {n} image(s)")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="Rename…", command=rename).pack(side="left")
+        ttk.Button(btns, text="Merge selected…", command=merge).pack(side="left", padx=6)
+        ttk.Button(btns, text="Delete selected…", command=delete).pack(side="left")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        fe.bind("<KeyRelease>", reload)
+        reload()
+        fe.focus_set()
+
     # ---------- albums (virtual: nothing is moved or copied unless you export) ----------
     def albums(self):
         return self.db.execute("SELECT id, name FROM albums ORDER BY pos, name").fetchall()
@@ -1376,17 +1712,33 @@ class App:
 
     def on_side_menu(self, event):
         i = self.side_list.nearest(event.y)
-        if i < 0 or i >= len(self.side_items) or self.side_items[i][1][0] != "album":
+        if i < 0 or i >= len(self.side_items):
             return
-        aid = self.side_items[i][1][1]
+        kind, ident = self.side_items[i][1]
         m = tk.Menu(self.root, tearoff=0)
-        m.add_command(label="Rename…", command=lambda: self.rename_album(aid))
-        m.add_command(label="Move up", command=lambda: self.move_album(aid, -1))
-        m.add_command(label="Move down", command=lambda: self.move_album(aid, 1))
-        m.add_separator()
-        m.add_command(label="Copy or move to a real folder…", command=lambda: self.export_album(aid))
-        m.add_separator()
-        m.add_command(label="Delete album…", command=lambda: self.delete_album(aid))
+        if kind == "album":
+            m.add_command(label="Rename…", command=lambda: self.rename_album(ident))
+            m.add_command(label="Move up", command=lambda: self.move_album(ident, -1))
+            m.add_command(label="Move down", command=lambda: self.move_album(ident, 1))
+            m.add_separator()
+            m.add_command(label="Copy or move to a real folder…", command=lambda: self.export_album(ident))
+            m.add_separator()
+            m.add_command(label="Delete album…", command=lambda: self.delete_album(ident))
+        elif kind == "smart":
+            m.add_command(label="What does this match?", command=lambda: self.describe_smart(ident))
+            m.add_command(label="Replace with the current view", command=lambda: self.replace_smart(ident))
+            m.add_command(label="Rename…", command=lambda: self.rename_smart(ident))
+            m.add_command(label="Move up", command=lambda: self.move_smart(ident, -1))
+            m.add_command(label="Move down", command=lambda: self.move_smart(ident, 1))
+            m.add_separator()
+            m.add_command(label="Delete smart album…", command=lambda: self.delete_smart(ident))
+        elif kind == "tag":
+            m.add_command(label="Rename tag…", command=lambda: self.quick_rename_tag(ident))
+            m.add_command(label="Delete tag…", command=lambda: self.quick_delete_tag(ident))
+        if m.index("end") is not None:
+            m.add_separator()
+        m.add_command(label="Save current view as smart album…", command=self.save_smart)
+        m.add_command(label="Manage tags…", command=self.tag_dialog)
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1552,6 +1904,8 @@ class App:
         on("<Control-f>", self.focus_search, True)
         on("<Control-Shift-F>", self.toggle_filters, True)
         on("<Control-o>", self.add_folder, True)
+        on("<Control-s>", self.save_smart, True)
+        on("<Control-t>", self.tag_dialog, True)
         on("<Control-a>", self.select_page)
         on("<Escape>", self.clear_selection)
         on("<Return>", lambda: self.open_viewer(self.primary))
@@ -1652,6 +2006,8 @@ class App:
             "  Ctrl+F                jump to search\n"
             "  Ctrl+Shift+F          show / hide the detail filters\n"
             "  Ctrl+O                add a folder\n"
+            "  Ctrl+S                save the current view as a smart album\n"
+            "  Ctrl+T                open the tag manager\n"
             "  Ctrl+A                select the whole page\n"
             "  Esc                   clear the selection\n"
             "  Arrow keys            move the selection (Home / End: first / last on the page)\n"
@@ -1911,6 +2267,9 @@ class App:
                 bordercolor=pal["bg"])
             mp("TScrollbar", background=[("active", pal["btn_active"])])
             cfg("Horizontal.TProgressbar", background=pal["sel"], troughcolor=pal["field"])
+            cfg("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"])
+            cfg("Treeview.Heading", background=pal["btn"], foreground=pal["fg"])
+            mp("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["selfg"])])
             cfg("TLabel", background=pal["bg"], foreground=pal["fg"])
         else:
             style.theme_use(self.default_theme)  # back to the native Windows look

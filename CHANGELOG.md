@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.15
+- Smart albums: save any view (search, sidebar view, type, detail filters) and it stays up to date
+- Tag manager: rename, merge and delete tags library-wide, with restore points for large changes
+- Ctrl+S saves a smart album, Ctrl+T opens the tag manager
+- Filter boxes ignore nan / inf instead of failing
+
 ## v1.14
 - Keyboard shortcuts (F1 lists them): arrows, Enter, Esc, Delete, 0-5 ratings, F favourite, F5, Ctrl+F, Ctrl+O, Ctrl+A, Page Up/Down
 - Detail filters: shape, width/height, file size, taken date, format
