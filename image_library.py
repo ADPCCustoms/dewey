@@ -199,9 +199,18 @@ def similar_worker(db_path, threshold, q, cancel):
         q.put(("error", str(e)))
 
 
-def fit_zoom(iw, ih, cw, ch):
-    """Zoom that fits the whole image in the viewport (never enlarges past 100%)."""
-    return min(cw / max(1, iw), ch / max(1, ih), 1.0)
+def fit_zoom(iw, ih, cw, ch, cap=1.0):
+    """Zoom that fits the whole image in the viewport (by default never enlarging past 100%)."""
+    z = min(cw / max(1, iw), ch / max(1, ih))
+    return z if cap is None else min(z, cap)
+
+
+def link_pane(a_img, a_z, a_cx, a_cy, a_old_z, b_img, b_z):
+    """Linked compare panes: where pane B should look, and at what zoom, when pane A changes.
+    Same relative position in the picture, and the same zoom factor as A just changed by."""
+    if a_old_z:
+        b_z = min(max(b_z * (a_z / a_old_z), 0.02), 32.0)
+    return b_z, a_cx / a_img.width * b_img.width, a_cy / a_img.height * b_img.height
 
 
 def clamp_center(cx, cy, iw, ih):
@@ -894,6 +903,9 @@ class App:
         mrow.pack(fill="x", pady=(0, 4))
         ttk.Button(mrow, text="Manage tags…", command=self.tag_dialog).pack(side="left")
         ttk.Button(mrow, text="Save view…", command=self.save_smart).pack(side="left", padx=4)
+        crow = ttk.Frame(d)
+        crow.pack(fill="x", pady=(0, 4))
+        ttk.Button(crow, text="Compare 2 selected", command=self.compare_selected).pack(side="left")
         row = ttk.Frame(d)
         row.pack(fill="x")
         ttk.Button(row, text="View", command=lambda: self.open_viewer(self.primary)).pack(side="left")
@@ -1972,6 +1984,7 @@ class App:
         for n in range(6):
             on(f"<Key-{n}>", lambda n=n: self.rate_selected(n))
         on("<Key-f>", self.toggle_fav)
+        on("<Key-c>", self.compare_selected)
 
     def focus_search(self):
         self.search_entry.focus_set()
@@ -2013,16 +2026,19 @@ class App:
 
     def delete_selected(self):
         """Delete key: move the selected images to the app trash (undoable from Restore points)."""
-        ids = list(self.selected)
+        self.trash_ids(list(self.selected))
+
+    def trash_ids(self, ids):
+        """Ask, then move these images to the app trash and drop them from the library. Returns how many."""
         if not ids:
-            return
+            return 0
         rows = self.db.execute(
             f"SELECT id, path FROM images WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
         if not messagebox.askyesno(
                 "Delete images",
                 f"Move {len(rows)} image(s) to the app trash?\n\nThe files leave their folders and the "
                 "library entries are removed. You can undo this from Restore points."):
-            return
+            return 0
         rp = self.begin_point(f"Delete {len(rows)} images")
         done = failed = 0
         for iid, path in rows:
@@ -2042,6 +2058,7 @@ class App:
         self.status.config(text=f"Moved {done} image(s) to the trash" + (f", {failed} failed" if failed else ""))
         self.cache.clear()
         self.refresh()
+        return done
 
     def show_shortcuts(self):
         win = tk.Toplevel(self.root)
@@ -2067,6 +2084,7 @@ class App:
             "  Delete                move the selected images to the trash (undoable)\n"
             "  0 to 5                set the rating of the selected images\n"
             "  F                     toggle favourite on the selected images\n"
+            "  C                     compare the two selected images side by side\n"
             "  Ctrl + mouse wheel    thumbnail size\n"
             "  Ctrl / Shift + click  select several images\n\n"
             "Full-size viewer\n"
@@ -2079,6 +2097,16 @@ class App:
             "  S                     start / stop the slideshow ([ and ] change the delay)\n"
             "  F11                   full screen (Esc leaves it)\n"
             "  0 to 5, F             rate, favourite\n"
+            "  Esc                   close\n\n"
+            "Compare window\n"
+            "  Mouse wheel / drag    zoom / pan (both images together while linked)\n"
+            "  B                     switch between side by side and blink\n"
+            "  Space                 flip between the two images in blink mode\n"
+            "  A                     auto-blink on / off\n"
+            "  S                     swap the two images\n"
+            "  L                     link / unlink zoom and pan\n"
+            "  Z, + / -              fit or 100%, zoom\n"
+            "  0 to 5, F             rate / favourite the image under the pointer\n"
             "  Esc                   close\n\n"
             "Letters, digits and arrows are left alone while you are typing in a box or using a "
             "dropdown or list, so click a thumbnail first to use the shortcuts."))
@@ -3034,6 +3062,356 @@ class App:
             st["ready"] = True
             load()
             canvas.focus_set()
+
+        win.after(80, start)
+
+    # ---------- compare two images ----------
+    def compare_selected(self):
+        order = [r[0] for r in self.rows if r[0] in self.selected]
+        if not order:
+            self.status.config(text="Select two images (Ctrl-click), then press C to compare them")
+            return
+        if len(order) != 2:
+            messagebox.showinfo("Compare", "Select exactly two images on this page (Ctrl-click) to compare.")
+            return
+        self.open_compare(order)
+
+    def open_compare(self, ids):
+        panes = []
+        for iid in ids:
+            path, fav, rating = self.db.execute("SELECT path, fav, rating FROM images WHERE id=?",
+                                                (iid,)).fetchone()
+            panes.append({"id": iid, "path": path, "img": None, "bytes": 0, "z": 1.0, "cx": 0.0,
+                          "cy": 0.0, "fav": fav or 0, "rating": rating or 0})
+        win = tk.Toplevel(self.root)
+        win.geometry("1400x820")
+        win.configure(bg="black")
+        win.no_theme = True
+        BAR = "#141414"
+        bar = tk.Frame(win, bg=BAR)
+        bar.pack(side="top", fill="x")
+        body = tk.Frame(win, bg="black")
+        body.pack(fill="both", expand=True)
+        body.grid_rowconfigure(0, weight=1)
+        link_var = tk.BooleanVar(value=True)
+        secs_var = tk.StringVar(value="0.8")
+        st = {"mode": "side", "cur": 0, "fit": True, "link": True, "drag": None, "hover": 0, "auto": False,
+              "closed": False, "ready": False, "hq": None, "resize": None, "job": None}
+        slots = []
+
+        def pane_for(slot):
+            return st["cur"] if st["mode"] == "blink" else slot
+
+        def csize(slot):
+            c = slots[slot]["canvas"]
+            return max(50, c.winfo_width()), max(50, c.winfo_height())
+
+        def caption(pi):
+            p = panes[pi]
+            dim = f"{p['img'].width}×{p['img'].height}" if p["img"] is not None else "missing"
+            return (f"{'AB'[pi]}   {Path(p['path']).name}  ·  {dim}  ·  {p['bytes'] / 1048576:.2f} MB   "
+                    f"{'♥ ' if p['fav'] else ''}{'★' * p['rating']}")
+
+        def update_title():
+            win.title(f"Compare: {Path(panes[0]['path']).name}  vs  {Path(panes[1]['path']).name}"
+                      f"   [{'linked' if st['link'] else 'unlinked'}]")
+
+        def settle_fit():
+            """Make each pane's zoom and centre match its fitted view, before zooming away from it."""
+            for pi, p in enumerate(panes):
+                if p["img"] is not None:
+                    cw, ch = csize(pi if st["mode"] == "side" else 0)
+                    p["z"] = fit_zoom(p["img"].width, p["img"].height, cw, ch, cap=None)
+                    p["cx"], p["cy"] = p["img"].width / 2, p["img"].height / 2
+
+        def draw(slot, hq=True):
+            pi, sl = pane_for(slot), slots[slot]
+            p, c = panes[pi], sl["canvas"]
+            c.delete("all")
+            sl["cap"].config(text=caption(pi))
+            cw, ch = csize(slot)
+            if p["img"] is None:
+                c.create_text(cw / 2, ch / 2, text="(file missing)", fill="white")
+                return
+            img = p["img"]
+            if st["fit"]:
+                p["z"] = fit_zoom(img.width, img.height, cw, ch, cap=None)
+                p["cx"], p["cy"] = img.width / 2, img.height / 2
+            crop, x0, y0, p["cx"], p["cy"] = render_view(img, p["cx"], p["cy"], p["z"], cw, ch, hq)
+            sl["photo"] = ImageTk.PhotoImage(crop)
+            c.create_image(x0, y0, anchor="nw", image=sl["photo"])
+            c.create_text(10, 8, anchor="nw", text="AB"[pi], fill="#ffd54a", font=("", 18, "bold"))
+
+        def render_all(hq=True):
+            if st["closed"]:
+                return
+            for slot in range(1 if st["mode"] == "blink" else 2):
+                draw(slot, hq)
+            update_title()
+
+        def later_sharp():
+            if st["hq"]:
+                win.after_cancel(st["hq"])
+            st["hq"] = win.after(200, lambda: render_all(True))
+
+        def sync(pi, old_z):
+            """Keep the other image looking at the same spot at the same zoom."""
+            a, b = panes[pi], panes[1 - pi]
+            if st["link"] and a["img"] is not None and b["img"] is not None:
+                b["z"], b["cx"], b["cy"] = link_pane(a["img"], a["z"], a["cx"], a["cy"], old_z, b["img"], b["z"])
+
+        # ---- zoom, pan, fit
+        def zoom_by(slot, factor, mx=None, my=None):
+            pi = pane_for(slot)
+            p = panes[pi]
+            if p["img"] is None:
+                return
+            if st["fit"]:
+                settle_fit()
+            cw, ch = csize(slot)
+            mx, my = (cw / 2 if mx is None else mx), (ch / 2 if my is None else my)
+            old = p["z"]
+            nz = min(max(old * factor, 0.02), 32.0)
+            if nz == old:
+                return
+            p["cx"], p["cy"] = clamp_center(*zoom_at(p["cx"], p["cy"], old, nz, mx, my, cw, ch),
+                                            p["img"].width, p["img"].height)
+            p["z"], st["fit"] = nz, False
+            sync(pi, old)
+            render_all(False)
+            later_sharp()
+
+        def on_wheel(slot):
+            def handler(e):
+                up = e.delta > 0 if e.delta else e.num == 4
+                zoom_by(slot, 1.2 if up else 1 / 1.2, e.x, e.y)
+            return handler
+
+        def drag_start(slot):
+            def handler(e):
+                pi = pane_for(slot)
+                st["drag"] = (e.x, e.y, panes[pi]["cx"], panes[pi]["cy"], pi)
+            return handler
+
+        def drag_move(slot):
+            def handler(e):
+                if not st["drag"]:
+                    return
+                x0, y0, cx0, cy0, pi = st["drag"]
+                p = panes[pi]
+                if p["img"] is None:
+                    return
+                if st["fit"]:
+                    settle_fit()
+                    cx0, cy0 = p["cx"], p["cy"]
+                    st["drag"] = (x0, y0, cx0, cy0, pi)
+                st["fit"] = False
+                p["cx"], p["cy"] = clamp_center(cx0 - (e.x - x0) / p["z"], cy0 - (e.y - y0) / p["z"],
+                                                p["img"].width, p["img"].height)
+                sync(pi, None)
+                render_all(False)
+                later_sharp()
+            return handler
+
+        def fit():
+            st["fit"] = True
+            render_all()
+
+        def actual():
+            settle_fit()
+            for p in panes:
+                p["z"] = 1.0
+            st["fit"] = False
+            sync(0, None)
+            render_all()
+
+        def toggle_actual():
+            fit() if not st["fit"] else actual()
+
+        # ---- modes: side by side, blink, auto-blink, swap, link
+        def set_mode(mode):
+            st["mode"] = mode
+            if mode == "blink":
+                slots[1]["frame"].grid_remove()
+                body.grid_columnconfigure(0, weight=1, uniform="")
+                body.grid_columnconfigure(1, weight=0, uniform="")
+            else:
+                slots[1]["frame"].grid(row=0, column=1, sticky="nsew")
+                for c in (0, 1):
+                    body.grid_columnconfigure(c, weight=1, uniform="pane")
+            mode_btn.config(text="Blink mode" if mode == "side" else "Side by side")
+            win.update_idletasks()
+            render_all()
+
+        def toggle_mode():
+            set_mode("blink" if st["mode"] == "side" else "side")
+
+        def flip():
+            if st["mode"] == "blink":
+                st["cur"] = 1 - st["cur"]
+                render_all()
+
+        def auto_tick():
+            st["job"] = None
+            if st["auto"] and not st["closed"] and st["mode"] == "blink":
+                flip()
+                try:
+                    delay = float(secs_var.get())
+                except ValueError:
+                    delay = 0.8
+                st["job"] = win.after(int(min(max(delay, 0.2), 5.0) * 1000), auto_tick)
+
+        def toggle_auto():
+            st["auto"] = not st["auto"]
+            auto_btn.config(text="Stop auto-blink" if st["auto"] else "Auto-blink")
+            if st["job"]:
+                win.after_cancel(st["job"])
+                st["job"] = None
+            if st["auto"]:
+                if st["mode"] != "blink":
+                    set_mode("blink")
+                auto_tick()
+
+        def swap():
+            panes[0], panes[1] = panes[1], panes[0]
+            render_all()
+
+        def toggle_link():
+            st["link"] = link_var.get()
+            if st["link"] and not st["fit"]:
+                sync(pane_for(st["hover"]), None)
+                render_all()
+            update_title()
+
+        # ---- per-image actions
+        def rate_pane(pi, n):
+            p = panes[pi]
+            p["rating"] = n
+            self.db.execute("UPDATE images SET rating=? WHERE id=?", (n, p["id"]))
+            self.db.commit()
+            render_all()
+
+        def fav_pane(pi):
+            p = panes[pi]
+            p["fav"] = 1 - p["fav"]
+            self.db.execute("UPDATE images SET fav=? WHERE id=?", (p["fav"], p["id"]))
+            self.db.commit()
+            render_all()
+
+        def trash_pane(pi):
+            if self.trash_ids([panes[pi]["id"]]):
+                close()
+
+        def close():
+            st["closed"] = True
+            for k in ("job", "hq", "resize"):
+                if st[k]:
+                    try:
+                        win.after_cancel(st[k])
+                    except tk.TclError:
+                        pass
+            win.destroy()
+            self.refresh()
+
+        def on_key(e):
+            if e.widget.winfo_class() in ("Spinbox", "Entry"):
+                return  # typing in the blink-speed box
+            c = e.char
+            hp = pane_for(st["hover"])
+            if c and c in "012345":
+                rate_pane(hp, int(c))
+            elif c.lower() == "f":
+                fav_pane(hp)
+            elif c.lower() == "b":
+                toggle_mode()
+            elif c == " ":
+                flip()
+            elif c.lower() == "a":
+                toggle_auto()
+            elif c.lower() == "s":
+                swap()
+            elif c.lower() == "l":
+                link_var.set(not link_var.get())
+                toggle_link()
+            elif c.lower() == "z":
+                toggle_actual()
+            elif c in ("+", "="):
+                zoom_by(st["hover"], 1.25)
+            elif c in ("-", "_"):
+                zoom_by(st["hover"], 1 / 1.25)
+
+        def on_resize(e):
+            if not st["ready"]:
+                return
+            if st["resize"]:
+                win.after_cancel(st["resize"])
+            st["resize"] = win.after(120, render_all)
+
+        # ---- build the panes
+        def button(parent, text, cmd, **kw):
+            b = tk.Button(parent, text=text, command=cmd, bg="#2b2b2b", fg="#dddddd", activebackground="#4a4a4a",
+                          activeforeground="#ffffff", relief="flat", bd=0, padx=8, pady=3, **kw)
+            return b
+
+        for slot in range(2):
+            frame = tk.Frame(body, bg="black")
+            head = tk.Frame(frame, bg="#101010")
+            head.pack(side="top", fill="x")
+            cap = tk.Label(head, text="", bg="#101010", fg="#dddddd", anchor="w")
+            cap.pack(side="left", padx=6, pady=3)
+            button(head, "Trash", lambda s=slot: trash_pane(pane_for(s))).pack(side="right", padx=4, pady=2)
+            button(head, "♥", lambda s=slot: fav_pane(pane_for(s))).pack(side="right", pady=2)
+            canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            canvas.bind("<MouseWheel>", on_wheel(slot))
+            canvas.bind("<Button-4>", on_wheel(slot))
+            canvas.bind("<Button-5>", on_wheel(slot))
+            canvas.bind("<ButtonPress-1>", drag_start(slot))
+            canvas.bind("<B1-Motion>", drag_move(slot))
+            canvas.bind("<Double-Button-1>", lambda e: toggle_actual())
+            canvas.bind("<Enter>", lambda e, s=slot: st.__setitem__("hover", s))
+            if slot == 0:
+                canvas.bind("<Configure>", on_resize)
+            frame.grid(row=0, column=slot, sticky="nsew", padx=(0, 1) if slot == 0 else 0)
+            body.grid_columnconfigure(slot, weight=1, uniform="pane")
+            slots.append({"frame": frame, "cap": cap, "canvas": canvas, "photo": None})
+
+        mode_btn = button(bar, "Blink mode", toggle_mode)
+        mode_btn.pack(side="left", padx=(6, 0), pady=5)
+        button(bar, "⇄ Swap", swap).pack(side="left", padx=(6, 0), pady=5)
+        auto_btn = button(bar, "Auto-blink", toggle_auto)
+        auto_btn.pack(side="left", padx=(6, 0), pady=5)
+        tk.Label(bar, text="every", bg=BAR, fg="#aaaaaa").pack(side="left", padx=(8, 0))
+        tk.Spinbox(bar, values=("0.3", "0.5", "0.8", "1", "1.5", "2", "3"), width=4, textvariable=secs_var,
+                   bg="#2b2b2b", fg="#dddddd", buttonbackground="#2b2b2b", relief="flat",
+                   insertbackground="#dddddd").pack(side="left", padx=(4, 0))
+        tk.Label(bar, text="s", bg=BAR, fg="#aaaaaa").pack(side="left", padx=(2, 0))
+        tk.Label(bar, text="|", bg=BAR, fg="#aaaaaa").pack(side="left", padx=(8, 0))
+        button(bar, "Fit", fit).pack(side="left", padx=(6, 0), pady=5)
+        button(bar, "100%", actual).pack(side="left", padx=(6, 0), pady=5)
+        button(bar, "−", lambda: zoom_by(st["hover"], 1 / 1.25)).pack(side="left", padx=(6, 0), pady=5)
+        button(bar, "+", lambda: zoom_by(st["hover"], 1.25)).pack(side="left", padx=(6, 0), pady=5)
+        tk.Checkbutton(bar, text="Link zoom and pan", variable=link_var, command=toggle_link, bg=BAR,
+                       fg="#aaaaaa", selectcolor="#2b2b2b", activebackground=BAR, activeforeground="#ffffff",
+                       highlightthickness=0, bd=0).pack(side="left", padx=(10, 0))
+        tk.Label(bar, text="0-5 / F rate or favourite the image under the pointer", bg=BAR,
+                 fg="#666666").pack(side="right", padx=8)
+
+        win.bind("<Key>", on_key)
+        win.bind("<Escape>", lambda e: close())
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.focus_force()
+
+        def start():
+            st["ready"] = True
+            for p in panes:
+                try:
+                    with Image.open(p["path"]) as im:
+                        p["img"] = im.convert("RGB")
+                    p["bytes"] = os.path.getsize(p["path"])
+                except Exception:
+                    p["img"] = None
+            render_all()
 
         win.after(80, start)
 

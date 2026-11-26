@@ -1,13 +1,11 @@
-## What's new in v1.16
+## What's new in v1.17
 
-**Full-size viewer, rebuilt**
-- Zoom with the mouse wheel, around the pointer. Drag to pan when zoomed in. Double-click (or Z) toggles between fit and 100%, and + / - zoom in steps. A Fit button, a 100% button and a zoom percentage are on the new control bar
-- Only the visible part of the image is drawn, so zooming and panning stay smooth even on very large images. A quick preview shows while you move and sharpens a moment after you stop
-- Slideshow: press S or the Slideshow button. Set the delay from 1 to 60 seconds in the box on the bar, or with [ and ] while it runs. The delay is remembered. An optional Shuffle tickbox picks images in random order, and the slideshow loops
-- Full screen with F11 (Esc leaves full screen first, then closes the viewer)
-- Navigation, rating (0 to 5) and favourite (F) work as before. Typing in the delay box no longer triggers them
+**Compare view**
+- Select exactly two images (Ctrl-click) and press C, or use the new Compare 2 selected button in the side panel
+- Side by side: both images at full size with their name, resolution, file size, rating and favourite shown above each
+- Linked zoom and pan: the mouse wheel zooms around the pointer and dragging pans, and the other image follows to the same spot at the same zoom, even when the two images have different resolutions. Untick Link zoom and pan (or press L) to move them separately
+- Blink mode (B): both images share one pane and you flip between them with Space, which makes small differences between similar generations easy to spot. Auto-blink (A) flips on a timer you can set from 0.3 to 3 seconds
+- Fit, 100% (true pixels) and zoom buttons, Z to toggle fit and 100%, and S to swap the two images
+- Decide on the spot: 0 to 5 and F rate or favourite the image under the pointer, and each image has its own heart and Trash buttons. Trash moves it to the app trash after confirming, and Restore points can undo it
 
-**Page size follows the thumbnail size**
-- The thumbnail slider now also changes how many images are on a page: 160 at the smallest size, 60 at the default, 20 at the largest. Switching sizes keeps you near the image you were looking at
-
-Existing libraries work as they are.
+Under the hood, the delete confirmation and trash step are shared with the Delete key. Existing libraries work as they are.

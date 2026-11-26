@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.17
+- Compare view: two images side by side with linked zoom and pan, or blink mode (manual and auto)
+- Rate, favourite or trash either image from the compare window
+- C key and Compare 2 selected button
+
 ## v1.16
 - Viewer: mouse-wheel zoom, drag to pan, fit / 100% toggle, control bar
 - Viewer: slideshow with adjustable delay (remembered), shuffle, looping; full screen with F11
