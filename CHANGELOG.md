@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.18
+- Export resized or converted copies (JPG, PNG, WebP) with size modes, quality, name patterns, presets and a preview
+- Metadata stripped by default, optional keep; transparency handled for JPG; EXIF rotation applied
+- Background export with progress and cancel; originals and library untouched
+- Ctrl+E, side panel button and album right-click entry
+
 ## v1.17
 - Compare view: two images side by side with linked zoom and pan, or blink mode (manual and auto)
 - Rate, favourite or trash either image from the compare window

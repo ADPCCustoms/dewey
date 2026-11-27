@@ -8,7 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
+from PIL.PngImagePlugin import PngInfo
 
 try:  # optional: enables dragging folders / images onto the window
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -726,6 +727,230 @@ def build_name(pattern, n, taken, kind, tag, stem):
     return safe_name(s)
 
 
+EXPORT_FORMATS = {"JPG": ".jpg", "PNG": ".png", "WebP": ".webp"}
+EXPORT_MODES = ["Keep original size", "Percentage", "Longest edge (px)", "Exact width (px)",
+                "Exact height (px)", "Fit inside box (px)"]
+EXPORT_DEFAULTS = dict(format="Keep original", quality=90, mode="Keep original size", a="", b="",
+                       enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}")
+EXPORT_PRESETS = {
+    "Web, 1600 px JPG": dict(format="JPG", quality=85, mode="Longest edge (px)", a="1600", b="",
+                             enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+    "Share, 1080 px JPG": dict(format="JPG", quality=88, mode="Longest edge (px)", a="1080", b="",
+                               enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+    "Thumbnails, 400 px WebP": dict(format="WebP", quality=80, mode="Longest edge (px)", a="400", b="",
+                                    enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+    "High quality JPG, full size": dict(format="JPG", quality=95, mode="Keep original size", a="", b="",
+                                        enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+    "Full size PNG, no metadata": dict(format="PNG", quality=90, mode="Keep original size", a="", b="",
+                                       enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+    "Half size, same format": dict(format="Keep original", quality=90, mode="Percentage", a="50", b="",
+                                   enlarge=False, bg="#ffffff", keep_meta=False, pattern="{name}"),
+}
+
+
+def parse_color(text):
+    t = (text or "").strip().lstrip("#")
+    if len(t) == 3:
+        t = "".join(c * 2 for c in t)
+    try:
+        if len(t) != 6:
+            raise ValueError
+        return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        raise ValueError("The background colour must look like #ffffff.")
+
+
+def target_size(iw, ih, mode, a, b, enlarge):
+    """Output size for a resize mode. Proportions are always kept."""
+    if mode == "Percentage":
+        scale = a / 100.0
+    elif mode == "Longest edge (px)":
+        scale = a / max(iw, ih)
+    elif mode == "Exact width (px)":
+        scale = a / iw
+    elif mode == "Exact height (px)":
+        scale = a / ih
+    elif mode == "Fit inside box (px)":
+        scale = min(a / iw, b / ih)
+    else:
+        return iw, ih
+    if not enlarge:
+        scale = min(scale, 1.0)
+    if max(iw, ih) * scale > 30000:  # a safety limit, not a real-world one
+        scale = 30000 / max(iw, ih)
+    return max(1, round(iw * scale)), max(1, round(ih * scale))
+
+
+def out_format(src, fmt):
+    """The format an image will be written in ('Keep original' follows the file; GIF becomes PNG)."""
+    if fmt in EXPORT_FORMATS:
+        return fmt
+    ext = os.path.splitext(str(src))[1].lower()
+    return "JPG" if ext in (".jpg", ".jpeg") else "WebP" if ext == ".webp" else "PNG"
+
+
+def build_export_opts(form):
+    """Check the dialog's values. Returns (options for export_one, None) or (None, message)."""
+    f = {**EXPORT_DEFAULTS, **form}
+    if f["format"] not in ("Keep original", *EXPORT_FORMATS):
+        return None, "Choose a format."
+    try:
+        q = int(f["quality"])
+    except (TypeError, ValueError):
+        return None, "Quality must be a number from 1 to 100."
+    if not 1 <= q <= 100:
+        return None, "Quality must be a number from 1 to 100."
+    mode, a, b = f["mode"], None, None
+    if mode not in EXPORT_MODES:
+        return None, "Choose how to resize."
+
+    def number(key, label, lo, hi):
+        try:
+            v = float(str(f[key]).strip().replace(",", "."))
+        except ValueError:
+            return None, f"Enter a number for {label}."
+        if v != v or not lo <= v <= hi:
+            return None, f"{label.capitalize()} must be between {lo} and {hi}."
+        return v, None
+
+    if mode != "Keep original size":
+        lim = (1, 1000) if mode == "Percentage" else (1, 30000)
+        label = "the percentage" if mode == "Percentage" else "the size in pixels"
+        if mode == "Fit inside box (px)":
+            a, err = number("a", "the box width", *lim)
+            if err:
+                return None, err
+            b, err = number("b", "the box height", *lim)
+        else:
+            a, err = number("a", label, *lim)
+        if err:
+            return None, err
+    try:
+        bg = parse_color(f["bg"])
+    except ValueError as e:
+        return None, str(e)
+    pattern = (f["pattern"] or "").strip()
+    if not pattern:
+        return None, "Enter a file name pattern, for example {name}."
+    return dict(format=f["format"], quality=q, mode=mode, a=a, b=b, enlarge=bool(f["enlarge"]),
+                bg=f["bg"], bg_rgb=bg, keep_meta=bool(f["keep_meta"]), pattern=pattern), None
+
+
+def oriented_size(path, w, h):
+    """Size as it will look after phone-style rotation (EXIF orientation 5 to 8 swaps width and height)."""
+    try:
+        with Image.open(path) as im:
+            if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):
+                return im.height, im.width
+            return im.width, im.height
+    except Exception:
+        return w, h
+
+
+def plan_export(rows, o, dest, tag_of, exact_first=12):
+    """rows: (id, path, taken, kind, width, height). Plans every output: unique file name in dest,
+    input and output size. Names never overwrite existing files or each other."""
+    dest, used, plan = Path(dest), set(), []
+    needs_size = "{w}" in o["pattern"] or "{h}" in o["pattern"]
+    key = lambda p: os.path.normcase(os.path.normpath(str(p)))
+    for n, (iid, path, taken, kind, w, h) in enumerate(rows, 1):
+        src = Path(path)
+        if not (w and h):
+            w, h = image_details(src)[:2]
+        if n <= exact_first or needs_size:
+            w, h = oriented_size(src, w, h)
+        nw, nh = target_size(w, h, o["mode"], o["a"], o["b"], o["enlarge"]) if w and h else (w, h)
+        ext = EXPORT_FORMATS[out_format(src, o["format"])]
+        pattern = o["pattern"].replace("{w}", str(nw)).replace("{h}", str(nh))
+        stem = build_name(pattern, n, taken or "0000-00-00", kind or "other", tag_of(iid), src.stem)
+        cand, k = dest / (stem + ext), 1
+        while key(cand) in used or cand.exists():
+            cand, k = dest / f"{stem}_{k}{ext}", k + 1
+        used.add(key(cand))
+        plan.append({"id": iid, "src": src, "dest": cand, "size_in": (w, h), "size_out": (nw, nh)})
+    return plan
+
+
+def export_one(src, dest, o):
+    """Write one resized / converted copy. The original is never touched; the file is written under a
+    temporary name and renamed, so a cancelled run leaves no half-written images."""
+    fmt = out_format(src, o["format"])
+    keep = o["keep_meta"]
+    with Image.open(src) as im0:
+        im0.load()
+        text = dict(getattr(im0, "text", None) or {}) if keep else {}
+        icc = im0.info.get("icc_profile")  # colour profile: colour data, not private data, so always kept
+        im = ImageOps.exif_transpose(im0)  # phone photos come out the right way up
+        exif = None
+        if keep:
+            ex = im.getexif()
+            ex.pop(0x0112, None)  # orientation is already applied
+            exif = ex.tobytes() if len(ex) else None
+        if im is im0:
+            im = im0.copy()
+    has_alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+    if fmt == "JPG":
+        if has_alpha:  # JPG cannot be see-through: lay it on the chosen background
+            rgba = im.convert("RGBA")
+            flat = Image.new("RGB", rgba.size, o.get("bg_rgb") or parse_color(o.get("bg", "#ffffff")))
+            flat.paste(rgba, mask=rgba.getchannel("A"))
+            im = flat
+        else:
+            im = im.convert("RGB")
+    elif fmt == "PNG":
+        if im.mode not in ("RGB", "RGBA", "L", "LA"):
+            im = im.convert("RGBA" if has_alpha else "RGB")
+    else:
+        im = im.convert("RGBA" if has_alpha else "RGB")
+    iw, ih = im.size
+    nw, nh = target_size(iw, ih, o["mode"], o["a"], o["b"], o["enlarge"])
+    if (nw, nh) != (iw, ih):
+        im = im.resize((nw, nh), Image.LANCZOS if nw * nh <= iw * ih else Image.BICUBIC)
+    kw = {}
+    if icc:
+        kw["icc_profile"] = icc
+    if exif:
+        kw["exif"] = exif
+    q = int(o["quality"])
+    if fmt == "JPG":
+        kw.update(quality=q, optimize=True)
+    elif fmt == "PNG":
+        kw["optimize"] = True
+        if text:  # AI prompts live in PNG text chunks, so they only survive into PNG output
+            info = PngInfo()
+            for k, v in text.items():
+                info.add_text(str(k), str(v))
+            kw["pnginfo"] = info
+    else:
+        kw.update(quality=q, method=4, lossless=q >= 100)
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        im.save(tmp, format={"JPG": "JPEG", "PNG": "PNG", "WebP": "WEBP"}[fmt], **kw)
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return im.size
+
+
+def export_worker(jobs, opts, q, cancel):
+    """Background thread: jobs = [(src, dest)]."""
+    ok = failed = 0
+    errors = []
+    for n, (src, dest) in enumerate(jobs, 1):
+        if cancel.is_set():
+            break
+        try:
+            export_one(src, dest, opts)
+            ok += 1
+        except Exception as e:
+            failed += 1
+            errors.append((str(src), str(e)))
+        q.put(("progress", n, len(jobs)))
+    q.put(("done", ok, failed, errors[:25], cancel.is_set()))
+
+
 # Markers some AI tools leave in a file's embedded metadata (IPTC/XMP "digital source type")
 AI_MARKERS = (b"trainedAlgorithmicMedia", b"Made with Google AI")
 
@@ -906,6 +1131,7 @@ class App:
         crow = ttk.Frame(d)
         crow.pack(fill="x", pady=(0, 4))
         ttk.Button(crow, text="Compare 2 selected", command=self.compare_selected).pack(side="left")
+        ttk.Button(crow, text="Export…", command=self.export_dialog).pack(side="left", padx=4)
         row = ttk.Frame(d)
         row.pack(fill="x")
         ttk.Button(row, text="View", command=lambda: self.open_viewer(self.primary)).pack(side="left")
@@ -1785,6 +2011,7 @@ class App:
             m.add_command(label="Move down", command=lambda: self.move_album(ident, 1))
             m.add_separator()
             m.add_command(label="Copy or move to a real folder…", command=lambda: self.export_album(ident))
+            m.add_command(label="Export resized or converted copies…", command=lambda: self.export_album_copies(ident))
             m.add_separator()
             m.add_command(label="Delete album…", command=lambda: self.delete_album(ident))
         elif kind == "smart":
@@ -1985,6 +2212,7 @@ class App:
             on(f"<Key-{n}>", lambda n=n: self.rate_selected(n))
         on("<Key-f>", self.toggle_fav)
         on("<Key-c>", self.compare_selected)
+        on("<Control-e>", self.export_dialog, True)
 
     def focus_search(self):
         self.search_entry.focus_set()
@@ -2085,6 +2313,7 @@ class App:
             "  0 to 5                set the rating of the selected images\n"
             "  F                     toggle favourite on the selected images\n"
             "  C                     compare the two selected images side by side\n"
+            "  Ctrl+E                export resized or converted copies\n"
             "  Ctrl + mouse wheel    thumbnail size\n"
             "  Ctrl / Shift + click  select several images\n\n"
             "Full-size viewer\n"
@@ -3064,6 +3293,331 @@ class App:
             canvas.focus_set()
 
         win.after(80, start)
+
+    # ---------- export resized or converted copies ----------
+    def export_album_copies(self, aid):
+        self.show_album(aid)
+        self.export_dialog(scope="current")
+
+    def stored_json(self, key, default):
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        try:
+            return json.loads(row[0]) if row else default
+        except ValueError:
+            return default
+
+    def store_json(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (key, json.dumps(value)))
+        self.db.commit()
+
+    def first_tag_of(self, iid):
+        t = self.db.execute("SELECT tag FROM tags WHERE image_id=? ORDER BY tag LIMIT 1", (iid,)).fetchone()
+        return t[0] if t else ""
+
+    def export_rows(self, scope):
+        cols = "SELECT id, path, taken, kind, width, height FROM images"
+        if scope == "selected":
+            ids = list(self.selected)
+            if not ids:
+                return []
+            return self.db.execute(cols + f" WHERE id IN ({','.join('?' * len(ids))}) ORDER BY taken, path",
+                                   ids).fetchall()
+        if scope == "all":
+            return self.db.execute(cols + " ORDER BY taken, path").fetchall()
+        w, p = self.where()
+        return self.db.execute(cols + w + " ORDER BY taken, path", p).fetchall()
+
+    def export_dialog(self, scope=None):
+        win = tk.Toplevel(self.root)
+        win.title("Export images")
+        win.geometry("760x820")
+        win.transient(self.root)
+        win.grab_set()
+        last = {**EXPORT_DEFAULTS, **self.stored_json("export_last", {})}
+        user_presets = self.stored_json("export_presets", {})
+        scope_var = tk.StringVar(value=scope or ("selected" if self.selected else "current"))
+        preset_var = tk.StringVar(value="")
+        fmt_var, mode_var = tk.StringVar(value=last["format"]), tk.StringVar(value=last["mode"])
+        q_var = tk.IntVar(value=int(last["quality"]))
+        a_var, b_var = tk.StringVar(value=str(last["a"])), tk.StringVar(value=str(last["b"]))
+        enlarge_var, meta_var = tk.BooleanVar(value=bool(last["enlarge"])), tk.BooleanVar(value=bool(last["keep_meta"]))
+        bg_var, pattern_var = tk.StringVar(value=last["bg"]), tk.StringVar(value=last["pattern"])
+        dest_var = tk.StringVar(value=self.stored_json("export_dest", ""))
+        add_var = tk.BooleanVar(value=False)
+        st = {"job": None}
+
+        pad = {"padx": 12, "pady": 3}
+
+        def heading(text):
+            ttk.Label(win, text=text, font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+
+        heading("Which images?")
+        sc = ttk.Frame(win)
+        sc.pack(anchor="w", padx=24)
+        for value, text in (("selected", "The selected images"), ("current", "Everything showing now"),
+                            ("all", "Whole library")):
+            ttk.Radiobutton(sc, text=text, variable=scope_var, value=value).pack(side="left", padx=(0, 14))
+
+        heading("Preset")
+        pr = ttk.Frame(win)
+        pr.pack(fill="x", **pad)
+        preset_box = ttk.Combobox(pr, textvariable=preset_var, state="readonly", width=34)
+        preset_box.pack(side="left")
+        save_btn = ttk.Button(pr, text="Save as preset…")
+        save_btn.pack(side="left", padx=6)
+        del_btn = ttk.Button(pr, text="Delete preset")
+        del_btn.pack(side="left")
+
+        heading("Format and quality")
+        fq = ttk.Frame(win)
+        fq.pack(fill="x", **pad)
+        ttk.Label(fq, text="Format:").pack(side="left")
+        fmt_box = ttk.Combobox(fq, textvariable=fmt_var, state="readonly", width=14,
+                               values=["Keep original", "JPG", "PNG", "WebP"])
+        fmt_box.pack(side="left", padx=6)
+        ttk.Label(fq, text="Quality:").pack(side="left", padx=(12, 0))
+        scale = tk.Scale(fq, from_=1, to=100, orient="horizontal", variable=q_var, length=220)
+        scale.pack(side="left", padx=6)
+        ttk.Label(fq, text="(100 = lossless WebP)").pack(side="left")
+
+        heading("Size")
+        sz = ttk.Frame(win)
+        sz.pack(fill="x", **pad)
+        mode_box = ttk.Combobox(sz, textvariable=mode_var, state="readonly", width=20, values=EXPORT_MODES)
+        mode_box.pack(side="left")
+        lab_a = ttk.Label(sz, text="", width=15, anchor="e")
+        lab_a.pack(side="left")
+        ent_a = ttk.Entry(sz, textvariable=a_var, width=8)
+        ent_a.pack(side="left", padx=4)
+        lab_b = ttk.Label(sz, text="", width=15, anchor="e")
+        lab_b.pack(side="left")
+        ent_b = ttk.Entry(sz, textvariable=b_var, width=8)
+        ent_b.pack(side="left", padx=4)
+        ttk.Checkbutton(win, text="Allow enlarging small images (off by default)",
+                        variable=enlarge_var).pack(anchor="w", padx=24)
+
+        heading("Transparency and metadata")
+        tm = ttk.Frame(win)
+        tm.pack(fill="x", **pad)
+        ttk.Label(tm, text="Background for see-through images when saving as JPG:").pack(side="left")
+        ttk.Entry(tm, textvariable=bg_var, width=9).pack(side="left", padx=6)
+        ttk.Checkbutton(win, variable=meta_var,
+                        text="Keep metadata (camera details; an AI prompt is kept only in PNG files)"
+                        ).pack(anchor="w", padx=24)
+        ttk.Label(win, foreground="#777777", text="Off by default: copies carry no prompt, location or edit "
+                  "history. Photos taken sideways are always rotated the right way up.").pack(anchor="w", padx=24)
+
+        heading("File names and destination")
+        nm = ttk.Frame(win)
+        nm.pack(fill="x", **pad)
+        ttk.Label(nm, text="Name pattern:").pack(side="left")
+        ttk.Entry(nm, textvariable=pattern_var, width=30).pack(side="left", padx=6)
+        ttk.Label(nm, foreground="#777777",
+                  text="{name} {date} {type} {tag} {n} {n:03} {w} {h}").pack(side="left")
+        ds = ttk.Frame(win)
+        ds.pack(fill="x", **pad)
+        ttk.Label(ds, text="Folder:").pack(side="left")
+        ttk.Entry(ds, textvariable=dest_var).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(ds, text="Browse…", command=lambda: dest_var.set(
+            filedialog.askdirectory(parent=win, title="Export to") or dest_var.get())).pack(side="left")
+        ttk.Checkbutton(win, variable=add_var,
+                        text="Add the exported copies to the library afterwards").pack(anchor="w", padx=24)
+
+        heading("Preview")
+        box = tk.Text(win, height=8, wrap="none", state="disabled")
+        box.pack(fill="both", expand=True, padx=12)
+        bar = ttk.Progressbar(win, mode="determinate")
+        bar.pack(fill="x", padx=12, pady=(6, 0))
+        status = ttk.Label(win, text="")
+        status.pack(anchor="w", padx=12, pady=4)
+
+        def show(text):
+            box.config(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.config(state="disabled")
+
+        def form():
+            return dict(format=fmt_var.get(), quality=q_var.get(), mode=mode_var.get(), a=a_var.get(),
+                        b=b_var.get(), enlarge=enlarge_var.get(), bg=bg_var.get(), keep_meta=meta_var.get(),
+                        pattern=pattern_var.get())
+
+        def apply(o):
+            o = {**EXPORT_DEFAULTS, **o}
+            fmt_var.set(o["format"])
+            q_var.set(int(o["quality"]))
+            mode_var.set(o["mode"])
+            a_var.set(str(o["a"]))
+            b_var.set(str(o["b"]))
+            enlarge_var.set(bool(o["enlarge"]))
+            bg_var.set(o["bg"])
+            meta_var.set(bool(o["keep_meta"]))
+            pattern_var.set(o["pattern"])
+            sync()
+
+        def sync(event=None):
+            mode = mode_var.get()
+            labels = {"Percentage": ("Percent:", ""), "Longest edge (px)": ("Longest edge px:", ""),
+                      "Exact width (px)": ("Width px:", ""), "Exact height (px)": ("Height px:", ""),
+                      "Fit inside box (px)": ("Box width px:", "Box height px:")}
+            la, lb = labels.get(mode, ("", ""))
+            lab_a.config(text=la)
+            lab_b.config(text=lb)
+            ent_a.config(state="normal" if mode != "Keep original size" else "disabled")
+            ent_b.config(state="normal" if mode == "Fit inside box (px)" else "disabled")
+            scale.config(state="disabled" if fmt_var.get() == "PNG" else "normal")
+
+        def all_presets():
+            return {**EXPORT_PRESETS, **user_presets}
+
+        def reload_presets():
+            preset_box.config(values=list(all_presets()))
+
+        def on_preset(event=None):
+            o = all_presets().get(preset_var.get())
+            if o:
+                apply(o)
+
+        def save_preset():
+            o, err = build_export_opts(form())
+            if err:
+                messagebox.showinfo("Preset", err, parent=win)
+                return
+            name = simpledialog.askstring("Save preset", "Name for this preset:", parent=win)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            if name in EXPORT_PRESETS:
+                messagebox.showinfo("Preset", "That is the name of a built-in preset. Choose another.", parent=win)
+                return
+            user_presets[name] = {k: o[k] for k in EXPORT_DEFAULTS if k in o}
+            user_presets[name]["a"] = form()["a"]
+            user_presets[name]["b"] = form()["b"]
+            self.store_json("export_presets", user_presets)
+            reload_presets()
+            preset_var.set(name)
+
+        def delete_preset():
+            name = preset_var.get()
+            if name in user_presets:
+                del user_presets[name]
+                self.store_json("export_presets", user_presets)
+                preset_var.set("")
+                reload_presets()
+            else:
+                messagebox.showinfo("Preset", "Built-in presets cannot be deleted. "
+                                    "Pick one of your own presets first.", parent=win)
+
+        def preview():
+            o, err = build_export_opts(form())
+            if err:
+                show(err)
+                return
+            rows = self.export_rows(scope_var.get())
+            if not rows:
+                show("No images to export." + (" Select some images first." if scope_var.get() == "selected" else ""))
+                return
+            dest = dest_var.get().strip()
+            plan = plan_export(rows, o, dest or ".", self.first_tag_of)
+            lines = [f"{len(plan)} image(s)  →  {dest or '(choose a folder first)'}", ""]
+            for it in plan[:12]:
+                (iw, ih), (ow, oh) = it["size_in"], it["size_out"]
+                lines.append(f"{it['src'].name}  ({iw}×{ih})   →   {it['dest'].name}  ({ow}×{oh})")
+            if len(plan) > 12:
+                lines.append(f"... and {len(plan) - 12} more")
+            show("\n".join(lines))
+
+        def finish(ok, failed, errors, cancelled, dest):
+            st["job"] = None
+            go_btn.config(state="normal")
+            close_btn.config(text="Close")
+            text = f"Exported {ok} image(s)" + (f", {failed} failed" if failed else "") + (" (cancelled)" if cancelled else "")
+            status.config(text=text)
+            show(text + ("\n\n" + "\n".join(f"{Path(p).name}: {e}" for p, e in errors) if errors else ""))
+            if add_var.get() and ok:
+                self.start_index([dest])
+
+        def poll():
+            job = st["job"]
+            if not job:
+                return
+            q, _, dest = job
+            done = None
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    if msg[0] == "progress":
+                        bar.config(maximum=max(1, msg[2]), value=msg[1])
+                        status.config(text=f"Exporting… {msg[1]} of {msg[2]}")
+                    elif msg[0] == "done":
+                        done = msg
+            except queue.Empty:
+                pass
+            if done:
+                finish(done[1], done[2], done[3], done[4], dest)
+            else:
+                win.after(150, poll)
+
+        def run():
+            o, err = build_export_opts(form())
+            if err:
+                messagebox.showinfo("Export", err, parent=win)
+                return
+            dest = dest_var.get().strip()
+            if not dest:
+                messagebox.showinfo("Export", "Choose a folder to export to.", parent=win)
+                return
+            rows = self.export_rows(scope_var.get())
+            if not rows:
+                messagebox.showinfo("Export", "There are no images to export.", parent=win)
+                return
+            try:
+                Path(dest).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                messagebox.showinfo("Export", f"Cannot use that folder: {e}", parent=win)
+                return
+            plan = plan_export(rows, o, dest, self.first_tag_of, exact_first=0)
+            if not messagebox.askyesno("Export", f"Write {len(plan)} copies to\n{dest}?\n\n"
+                                       "Your original images are not changed.", parent=win):
+                return
+            self.store_json("export_last", {**{k: o[k] for k in EXPORT_DEFAULTS if k in o},
+                                             "a": form()["a"], "b": form()["b"]})
+            self.store_json("export_dest", dest)
+            q, cancel = queue.Queue(), threading.Event()
+            st["job"] = (q, cancel, dest)
+            go_btn.config(state="disabled")
+            close_btn.config(text="Cancel export")
+            bar.config(value=0, maximum=max(1, len(plan)))
+            threading.Thread(target=export_worker,
+                             args=([(it["src"], it["dest"]) for it in plan], o, q, cancel), daemon=True).start()
+            poll()
+
+        def close():
+            if st["job"]:
+                st["job"][1].set()  # cancel; finish() reports what was done
+                return
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="Preview", command=preview).pack(side="left")
+        ttk.Button(btns, text="Open folder", command=lambda: dest_var.get().strip() and os.path.isdir(
+            dest_var.get().strip()) and (os.startfile(dest_var.get().strip()) if os.name == "nt" else
+                                          subprocess.run(["xdg-open", dest_var.get().strip()]))).pack(side="left", padx=6)
+        close_btn = ttk.Button(btns, text="Close", command=close)
+        close_btn.pack(side="right")
+        go_btn = ttk.Button(btns, text="Export", command=run)
+        go_btn.pack(side="right", padx=6)
+
+        save_btn.config(command=save_preset)
+        del_btn.config(command=delete_preset)
+        preset_box.bind("<<ComboboxSelected>>", on_preset)
+        fmt_box.bind("<<ComboboxSelected>>", sync)
+        mode_box.bind("<<ComboboxSelected>>", sync)
+        win.protocol("WM_DELETE_WINDOW", close)
+        reload_presets()
+        sync()
+        show("Choose the options, then Preview to see the file names and sizes, or Export.")
 
     # ---------- compare two images ----------
     def compare_selected(self):

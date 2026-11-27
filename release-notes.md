@@ -1,11 +1,15 @@
-## What's new in v1.17
+## What's new in v1.18
 
-**Compare view**
-- Select exactly two images (Ctrl-click) and press C, or use the new Compare 2 selected button in the side panel
-- Side by side: both images at full size with their name, resolution, file size, rating and favourite shown above each
-- Linked zoom and pan: the mouse wheel zooms around the pointer and dragging pans, and the other image follows to the same spot at the same zoom, even when the two images have different resolutions. Untick Link zoom and pan (or press L) to move them separately
-- Blink mode (B): both images share one pane and you flip between them with Space, which makes small differences between similar generations easy to spot. Auto-blink (A) flips on a timer you can set from 0.3 to 3 seconds
-- Fit, 100% (true pixels) and zoom buttons, Z to toggle fit and 100%, and S to swap the two images
-- Decide on the spot: 0 to 5 and F rate or favourite the image under the pointer, and each image has its own heart and Trash buttons. Trash moves it to the app trash after confirming, and Restore points can undo it
+**Export resized or converted copies**
+- New Export… button in the side panel (or Ctrl+E, or right-click an album) writes resized and converted copies of your images into a folder you choose. Your originals and your library are never changed
+- Choose the images: the selected ones, everything showing now, or the whole library
+- Formats: keep the original, or convert to JPG, PNG or WebP, with a quality setting (100 gives lossless WebP). Animated GIFs export as a still PNG
+- Sizes: keep the original, a percentage, longest edge, exact width, exact height, or fit inside a box. Proportions are always kept and small images are not enlarged unless you allow it
+- File names use the same patterns as rename ({name}, {date}, {type}, {tag}, {n:03}) plus {w} and {h} for the output size. Names never overwrite an existing file or each other
+- Transparency: see-through images saved as JPG are laid on a background colour you choose. PNG and WebP keep transparency
+- Metadata is stripped by default (no prompt, location or edit history). Tick Keep metadata to keep camera details, and an AI prompt is kept in PNG output. Colour profiles are always kept, and photos taken sideways are rotated the right way up
+- Presets: six built-in ones (such as Web 1600 px JPG, Thumbnails 400 px WebP, Full size PNG no metadata) and your own, saved and deleted from the dialog. Your last settings and folder are remembered
+- Preview shows the planned file names and sizes first. Exporting runs in the background with a progress bar and Cancel, and files are written under a temporary name so a cancelled run leaves nothing half-written
+- Optional tickbox to add the exported copies to the library afterwards
 
-Under the hood, the delete confirmation and trash step are shared with the Delete key. Existing libraries work as they are.
+Existing libraries work as they are.
